@@ -47,19 +47,24 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      - name: Install Inno Setup
+      - name: Locate Inno Setup
         shell: pwsh
         run: |
-          choco install innosetup --yes --no-progress
           $iscc = Get-Command ISCC.exe -ErrorAction SilentlyContinue
           if (-not $iscc) {
             $fallback = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+            if (-not (Test-Path $fallback)) {
+              choco install innosetup --yes --no-progress
+              if ($LASTEXITCODE -ne 0) {
+                throw "Chocolatey could not install Inno Setup."
+              }
+            }
             if (-not (Test-Path $fallback)) {
               throw "ISCC.exe was not found after installing Inno Setup."
             }
             $iscc = Get-Item $fallback
           }
-          & $iscc.Source /?
+          "Using Inno Setup: $($iscc.Source)"
           "ISCC_PATH=$($iscc.Source)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Read installer version
