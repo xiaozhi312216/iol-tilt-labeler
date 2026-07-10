@@ -98,12 +98,8 @@ jobs:
           if (-not (Test-Path $app)) {
             throw "Expected application executable was not built: $app"
           }
-          $englishLanguage = "${env:ProgramFiles(x86)}\Inno Setup 6\Languages\English.isl"
-          if (-not (Test-Path $englishLanguage)) {
-            throw "Inno Setup English language file was not found: $englishLanguage"
-          }
           $iss = "packaging\windows\IOL-Tilt-Labeler.iss"
-          (Get-Content $iss -Raw).Replace("compiler:Languages\ChineseSimplified.isl", $englishLanguage) | Set-Content $iss -Encoding utf8
+          (Get-Content $iss -Raw) -replace '(?m)^Name: "chinesesimplified"; MessagesFile: "compiler:Languages\\ChineseSimplified\.isl"\r?\n', '' | Set-Content $iss -Encoding utf8
           & $env:ISCC_PATH $iss
           if (-not (Test-Path $env:INSTALLER_PATH)) {
             throw "Expected installer was not built: $env:INSTALLER_PATH"
