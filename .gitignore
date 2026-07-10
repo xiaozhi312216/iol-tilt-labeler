@@ -1,0 +1,38 @@
+# Python / packaging artifacts
+build/
+dist/
+release/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Platform and editor files
+.DS_Store
+Thumbs.db
+
+# Local apps and launchers
+LOL.app/
+*.command
+
+# Patient images, historical case material, and local processing output
+01_原始参考图/
+02_最终确认案例_f2d944_1.345/
+03_31f541核对过程/
+04_待测图历史过程/
+原图/
+99_系统缓存/
+**/IOL_Tilt_Output/
+**/labels.json
+**/iol_tilt_results.csv
+**/iol_tilt_results.xlsx
+
+# Local legacy scripts and notes not used by the Windows release
+00_工具程序/iol_tilt_labeler.py
+00_工具程序/iol_tilt_labeler.py.before_ui_redesign
+00_工具程序/iol_tilt_labeler.tkinter.bak
+00_工具程序/measure_iol_tilt.py
+00_工具程序/prepare_iol_case.py
+00_工具程序/IOL_Tilt_Labeler_使用说明.md
+README_先看我.md
+验证软件.rtf

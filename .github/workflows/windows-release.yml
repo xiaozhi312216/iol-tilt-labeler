@@ -1,0 +1,135 @@
+name: Build Windows installer
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+    paths:
+      - "00_工具程序/**"
+      - "packaging/windows/**"
+      - "resources/windows/**"
+      - "requirements.txt"
+      - ".github/workflows/windows-release.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "00_工具程序/**"
+      - "packaging/windows/**"
+      - "resources/windows/**"
+      - "requirements.txt"
+      - ".github/workflows/windows-release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: x64
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --yes --no-progress
+          $iscc = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+          if (-not $iscc) {
+            $fallback = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+            if (-not (Test-Path $fallback)) {
+              throw "ISCC.exe was not found after installing Inno Setup."
+            }
+            $iscc = Get-Item $fallback
+          }
+          & $iscc.Source /?
+          "ISCC_PATH=$($iscc.Source)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Read installer version
+        id: version
+        shell: pwsh
+        run: |
+          $iss = Get-Content "packaging/windows/IOL-Tilt-Labeler.iss" -Raw
+          if ($iss -notmatch '#define MyAppVersion "([^"]+)"') {
+            throw "MyAppVersion is missing from the Inno Setup script."
+          }
+          $version = $Matches[1]
+          "value=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "INSTALLER_PATH=release\windows\IOL-Tilt-Labeler-Setup-x64-$version.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Validate release tag version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $tagVersion = "${{ github.ref_name }}".TrimStart("v")
+          if ($tagVersion -ne "${{ steps.version.outputs.value }}") {
+            throw "Tag v$tagVersion does not match installer version ${{ steps.version.outputs.value }}."
+          }
+
+      - name: Build application
+        run: pyinstaller --noconfirm --clean --distpath dist --workpath build packaging\windows\IOL-Tilt-Labeler.spec
+
+      - name: Build installer and verify outputs
+        shell: pwsh
+        run: |
+          $app = "dist\IOL Tilt Labeler\IOL Tilt Labeler.exe"
+          if (-not (Test-Path $app)) {
+            throw "Expected application executable was not built: $app"
+          }
+          & $env:ISCC_PATH "packaging\windows\IOL-Tilt-Labeler.iss"
+          if (-not (Test-Path $env:INSTALLER_PATH)) {
+            throw "Expected installer was not built: $env:INSTALLER_PATH"
+          }
+          if ((Get-Item $env:INSTALLER_PATH).Length -eq 0) {
+            throw "Installer is empty: $env:INSTALLER_PATH"
+          }
+          $hash = (Get-FileHash $env:INSTALLER_PATH -Algorithm SHA256).Hash.ToLower()
+          @(
+            "Installer: $(Split-Path $env:INSTALLER_PATH -Leaf)"
+            "Version: ${{ steps.version.outputs.value }}"
+            "SHA256: $hash"
+          ) | Set-Content "release\windows\setup-manifest.txt" -Encoding utf8
+          "SHA256=$hash" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: IOL-Tilt-Labeler-windows-x64-${{ steps.version.outputs.value }}-${{ github.sha }}
+          path: |
+            ${{ env.INSTALLER_PATH }}
+            release/windows/setup-manifest.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $notes = @"
+          ## Windows x64 installer
+
+          - Current-user installation; administrator privileges are not required.
+          - SHA-256: ``$env:SHA256``
+          - This installer is not code-signed, so Windows SmartScreen may show a warning.
+          - Measurement result represents a 2D IOL angle relative to the A-B reference line; it is not a 3D clinical IOL tilt measurement.
+          "@
+          gh release create "${{ github.ref_name }}" $env:INSTALLER_PATH "release\windows\setup-manifest.txt" --title "IOL Tilt Labeler ${{ github.ref_name }}" --notes $notes
