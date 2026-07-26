@@ -1,420 +1,218 @@
 #!/usr/bin/env python3
-"""IOL Tilt Labeler — PySide6 版本。
+"""IOL Tilt Labeler — 桌面版（macOS / Windows 通用）。
 
-界面按苹果风设计稿重写；测量算法与数据层完全复用 iol_core（与旧 Tkinter 版一致）。
-两栏布局：左=全部操作区（结果面板/开始/工作流/保存/备注/明细/视图/图例/编辑），右=影像画布。
+界面：左侧控制栏 + 右侧影像工作区 + 底部状态条，跟随系统浅色/深色。
+算法与数据层完全复用 iol_core：自动轴优先，第 5 步只做校验，Excel 只导四列。
 """
 
 from __future__ import annotations
 
 import json
+import os
 import sys
 import traceback
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Qt, QPoint, QPointF, QRectF, Signal
+from PySide6.QtCore import Qt, QEvent, QPointF, QSize, QTimer
 from PySide6.QtGui import (
-    QColor, QFont, QImage, QPainter, QPen, QBrush, QPixmap,
-    QLinearGradient, QPainterPath, QFontMetrics, QIcon, QKeySequence, QAction,
+    QAction, QActionGroup, QBrush, QColor, QFont, QIcon, QKeySequence,
+    QLinearGradient, QPainter, QPainterPath, QPen, QPixmap,
 )
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QLabel, QPushButton, QFrame,
-    QHBoxLayout, QVBoxLayout, QGridLayout, QScrollArea, QLineEdit,
-    QPlainTextEdit, QFileDialog, QMessageBox, QSizePolicy,
+    QApplication, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel,
+    QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
+    QPushButton, QScrollArea, QSizePolicy, QSlider, QVBoxLayout, QWidget,
 )
-
-from platform_utils import open_path, resource_path, ui_font_families
 
 import iol_core as core
 from iol_core import (
-    SUPPORTED_EXTS, MODE_META, as_points, default_label, fmt_number,
-    fmt_point, final_angle_text, atomic_write_text, unique_suffix,
-    compute_result, save_annotated_image, row_for_image, write_xlsx,
-    generate_calibration_images,
+    MODE_META, SUPPORTED_EXTS, as_points, atomic_write_text, compute_result,
+    default_label, final_angle_text, fmt_number, fmt_point,
+    generate_calibration_images, row_for_image, save_annotated_image,
+    unique_suffix, write_xlsx,
 )
+from platform_utils import open_path, resource_path, ui_font_families
+import theme
+from theme import ANN
+from canvas import ImageCanvas, KEY_COLOR
 
-Point = tuple[float, float]
+APP_NAME = "IOL Tilt Labeler"
+APP_VERSION = "1.2.0"
+SIDEBAR_WIDTH = 292
 
-# ---- palette (design tokens) ----
-C = {
-    "bg": "#ffffff",
-    "surface": "#ffffff",
-    "surface2": "#fbfcfe",
-    "surface3": "#f5f7fb",
-    "topbar": "#f2f4f7",
-    "topbar_line": "#dcdfe5",
-    "canvas": "#070a12",
-    "text": "#1d1d1f",
-    "text2": "#5f6673",
-    "text3": "#8a91a0",
-    "line": "#e3e8f0",
-    "line2": "#eef2f7",
-    "primary": "#155bd0",
-    "primary_hover": "#0f49aa",
-    "primary_soft": "#eef5ff",
-    "accent1": "#6e56cf",
-    "accent2": "#0a84ff",
-    "success": "#167a3c",
-    "success_soft": "#f7fbf8",
-    "success_line": "#dcece1",
-    "danger": "#c9152b",
-    "danger_soft": "#fff0f3",
-    "dark": "#0f1a2e",
-    "dark2": "#16233d",
+_MAC = sys.platform == "darwin"
+CMD = "⌘" if _MAC else "Ctrl+"
+OPT = "⌥" if _MAC else "Alt+"
+SHIFT = "⇧" if _MAC else "Shift+"
+ENTER = "⏎" if _MAC else "Enter"
+
+MODES = ("guide", "pupil", "anterior", "posterior", "manual_axis")
+MODE_KEY = {"pupil": "pupil_plane", "manual_axis": "manual_iol_axis"}
+# 步骤名尽量短，说明文字放 tooltip
+MODE_SHORT = {
+    "guide": "C-D 参考线",
+    "pupil": "A-B 瞳孔平面",
+    "anterior": "晶体前表面",
+    "posterior": "晶体后表面",
+    "manual_axis": "自动轴校验",
 }
-
-# annotation colors (RGB tuples for overlay pens)
-ANN = {
-    "guide": "#ff9500",
-    "pupil": "#00b8d9",
-    "anterior": "#f5c400",
-    "posterior": "#ff8a3d",
-    "iol": "#28c46a",
-    "manual": "#a35cf0",
-    "intersection": "#ff2828",
-}
+MAX_POINTS = {"guide": 12, "pupil": 2, "anterior": 8, "posterior": 12, "manual_axis": 2}
 
 FONT_FAMILY, MONO_FAMILY = ui_font_families()
 
 
-def label_key_for_mode(mode: str) -> str:
-    return {"pupil": "pupil_plane", "manual_axis": "manual_iol_axis"}.get(mode, mode)
+def key_of(mode: str) -> str:
+    return MODE_KEY.get(mode, mode)
+
+
+_DOT_CACHE: dict[str, QIcon] = {}
+
+
+def dot_icon(color: str, size: int = 9) -> QIcon:
+    cached = _DOT_CACHE.get(color)
+    if cached is not None:
+        return cached
+    pm = QPixmap(size + 6, size + 6)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(color))
+    p.drawEllipse(3, 3, size, size)
+    p.end()
+    icon = QIcon(pm)
+    _DOT_CACHE[color] = icon
+    return icon
+
+
+def brand_pixmap(size: int = 22) -> QPixmap:
+    pm = QPixmap(size * 2, size * 2)
+    pm.setDevicePixelRatio(2.0)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    s = size * 2
+    grad = QLinearGradient(0, 0, s, s)
+    grad.setColorAt(0.0, QColor("#2f7cf6"))
+    grad.setColorAt(1.0, QColor("#1a4fd6"))
+    path = QPainterPath()
+    path.addRoundedRect(0, 0, s, s, s * 0.27, s * 0.27)
+    p.fillPath(path, QBrush(grad))
+    pen = QPen(QColor(255, 255, 255, 235))
+    pen.setWidthF(s * 0.055)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+    p.drawEllipse(s * 0.24, s * 0.24, s * 0.52, s * 0.52)
+    pen.setWidthF(s * 0.05)
+    p.setPen(pen)
+    p.drawLine(s * 0.16, s * 0.68, s * 0.84, s * 0.36)
+    p.end()
+    return pm
 
 
 # ============================================================
-#  Image canvas
+#  小部件
 # ============================================================
-class ImageCanvas(QWidget):
-    pointClicked = Signal(float, float)      # image coords
-    cursorMoved = Signal(float, float)
+class Section(QWidget):
+    """左栏分组：小标题 + 内容，没有大卡片。"""
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setMinimumSize(480, 360)
-        self.setMouseTracking(True)
-        self.setFocusPolicy(Qt.StrongFocus)
-        self.image: QImage | None = None
-        self.img_w = 0
-        self.img_h = 0
-        self.scale = 1.0
-        self.offset = QPointF(0, 0)
-        self._panning = False
-        self._pan_start = QPoint()
-        self._offset_start = QPointF()
-        self.overlay_getter = None   # callable -> label dict
-        self.result_getter = None    # callable -> result/preview dict or None
-
-    # ---- image management ----
-    def set_image(self, pil_image):
-        if pil_image is None:
-            self.image = None
-            self.update()
-            return
-        rgb = pil_image.convert("RGB")
-        data = rgb.tobytes("raw", "RGB")
-        self.img_w, self.img_h = rgb.size
-        self.image = QImage(data, self.img_w, self.img_h, self.img_w * 3, QImage.Format_RGB888).copy()
-        self.update()
-
-    def fit(self):
-        if not self.image:
-            return
-        cw = max(200, self.width() - 24)
-        ch = max(200, self.height() - 24)
-        self.scale = max(0.15, min(cw / self.img_w, ch / self.img_h, 1.3))
-        self._center()
-        self.update()
-
-    def _center(self):
-        vis_w = self.img_w * self.scale
-        vis_h = self.img_h * self.scale
-        self.offset = QPointF((self.width() - vis_w) / 2, (self.height() - vis_h) / 2)
-
-    def set_zoom(self, new_scale, center=None):
-        if not self.image:
-            return
-        new_scale = max(0.15, min(6.0, new_scale))
-        if center is None:
-            center = QPointF(self.width() / 2, self.height() / 2)
-        img_pt = self.widget_to_image(center)
-        self.scale = new_scale
-        # keep img_pt under the same screen point
-        self.offset = QPointF(center.x() - img_pt[0] * self.scale,
-                              center.y() - img_pt[1] * self.scale)
-        self.update()
-
-    # ---- coordinate transforms ----
-    def image_to_widget(self, x, y) -> QPointF:
-        return QPointF(x * self.scale + self.offset.x(), y * self.scale + self.offset.y())
-
-    def widget_to_image(self, pt: QPointF):
-        return ((pt.x() - self.offset.x()) / self.scale,
-                (pt.y() - self.offset.y()) / self.scale)
-
-    # ---- events ----
-    def mousePressEvent(self, e):
-        if not self.image:
-            return
-        if e.button() == Qt.LeftButton:
-            x, y = self.widget_to_image(QPointF(e.position()))
-            if 0 <= x < self.img_w and 0 <= y < self.img_h:
-                self.pointClicked.emit(x, y)
-        elif e.button() in (Qt.RightButton, Qt.MiddleButton):
-            self._panning = True
-            self._pan_start = e.position().toPoint()
-            self._offset_start = QPointF(self.offset)
-            self.setCursor(Qt.ClosedHandCursor)
-
-    def mouseMoveEvent(self, e):
-        if not self.image:
-            return
-        if self._panning:
-            delta = e.position().toPoint() - self._pan_start
-            self.offset = QPointF(self._offset_start.x() + delta.x(),
-                                  self._offset_start.y() + delta.y())
-            self.update()
-        else:
-            x, y = self.widget_to_image(QPointF(e.position()))
-            self.cursorMoved.emit(x, y)
-
-    def mouseReleaseEvent(self, e):
-        if e.button() in (Qt.RightButton, Qt.MiddleButton):
-            self._panning = False
-            self.setCursor(Qt.ArrowCursor)
-
-    def wheelEvent(self, e):
-        if not self.image:
-            return
-        factor = 1.1 if e.angleDelta().y() > 0 else 1 / 1.1
-        self.set_zoom(self.scale * factor, QPointF(e.position()))
-
-    # ---- painting ----
-    def paintEvent(self, _):
-        p = QPainter(self)
-        p.fillRect(self.rect(), QColor(C["canvas"]))
-        if not self.image:
-            p.setPen(QColor(C["text3"]))
-            f = QFont(FONT_FAMILY, 13)
-            p.setFont(f)
-            p.drawText(self.rect(), Qt.AlignCenter, "打开图片文件夹开始标注\n左键取点 · 右键/中键平移 · 滚轮缩放")
-            return
-        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        target = QRectF(self.offset.x(), self.offset.y(),
-                        self.img_w * self.scale, self.img_h * self.scale)
-        p.drawImage(target, self.image)
-        self._draw_overlays(p)
-
-    def _pen(self, key, width=2.0):
-        pen = QPen(QColor(ANN[key]))
-        pen.setWidthF(width)
-        pen.setCosmetic(True)
-        return pen
-
-    def _draw_marker(self, p, x, y, key, radius=5, text=None):
-        w = self.image_to_widget(x, y)
-        p.setPen(self._pen(key, 2.2))
-        p.setBrush(QColor(255, 255, 255))
-        p.drawEllipse(w, radius, radius)
-        if text:
-            p.setBrush(Qt.NoBrush)
-            p.setPen(QColor(ANN[key]))
-            f = QFont(FONT_FAMILY, 10, QFont.Bold)
-            p.setFont(f)
-            p.drawText(QPointF(w.x() + 8, w.y() - 6), text)
-
-    def _draw_polyline(self, p, pts, key, width=2.0):
-        if len(pts) < 2:
-            return
-        p.setPen(self._pen(key, width))
-        p.setBrush(Qt.NoBrush)
-        path = QPainterPath()
-        first = self.image_to_widget(*pts[0])
-        path.moveTo(first)
-        for pt in pts[1:]:
-            path.lineTo(self.image_to_widget(*pt))
-        p.drawPath(path)
-
-    def _draw_overlays(self, p):
-        if not self.overlay_getter:
-            return
-        label = self.overlay_getter()
-        guide = as_points(label.get("guide", []))
-        pupil = as_points(label.get("pupil_plane", []))
-        anterior = as_points(label.get("anterior", []))
-        posterior = as_points(label.get("posterior", []))
-        manual = as_points(label.get("manual_iol_axis", []))
-
-        self._draw_polyline(p, guide, "guide", 2)
-        for i, pt in enumerate(guide):
-            if i in (0, len(guide) - 1):
-                self._draw_marker(p, pt[0], pt[1], "guide", 4, "C/D" if i == 0 else None)
-
-        if len(pupil) == 2:
-            self._draw_polyline(p, pupil, "pupil", 2.4)
-        for i, pt in enumerate(pupil):
-            self._draw_marker(p, pt[0], pt[1], "pupil", 5, "A" if i == 0 else "B")
-
-        for i, pt in enumerate(anterior):
-            self._draw_marker(p, pt[0], pt[1], "anterior", 4, f"F{i+1}")
-        for i, pt in enumerate(posterior):
-            self._draw_marker(p, pt[0], pt[1], "posterior", 4, f"B{i+1}")
-
-        if len(manual) == 2:
-            self._draw_polyline(p, manual, "manual", 3)
-        for i, pt in enumerate(manual):
-            self._draw_marker(p, pt[0], pt[1], "manual", 5, "M1" if i == 0 else "M2")
-
-        # auto fit arcs + axis
-        try:
-            if len(anterior) >= 3 and len(posterior) >= 3:
-                front = core.fit_circle(anterior)
-                back = core.fit_circle(posterior)
-                iol_l, iol_r = core.circle_intersections(front, back)
-                y_front = sum(q[1] for q in anterior) / len(anterior)
-                y_back = sum(q[1] for q in posterior) / len(posterior)
-                x_min = min(q[0] for q in anterior + posterior + [iol_l, iol_r]) - 40
-                x_max = max(q[0] for q in anterior + posterior + [iol_l, iol_r]) + 40
-                fa = core.arc_points(front, x_min, x_max, y_front, y_front - 60, y_front + 60)
-                ba = core.arc_points(back, x_min, x_max, y_back, y_back - 60, y_back + 60)
-                self._draw_polyline(p, fa, "anterior", 2)
-                self._draw_polyline(p, ba, "posterior", 2)
-                self._draw_polyline(p, [iol_l, iol_r], "iol", 2.4)
-                self._draw_marker(p, iol_l[0], iol_l[1], "intersection", 5)
-                self._draw_marker(p, iol_r[0], iol_r[1], "intersection", 5)
-        except Exception:
-            pass
-
-
-# ============================================================
-#  Small UI helpers
-# ============================================================
-def card(title: str | None = None) -> tuple[QFrame, QVBoxLayout]:
-    frame = QFrame()
-    frame.setObjectName("Card")
-    lay = QVBoxLayout(frame)
-    lay.setContentsMargins(16, 16, 16, 16)
-    lay.setSpacing(10)
-    if title:
-        t = QLabel(title)
-        t.setObjectName("CardTitle")
-        lay.addWidget(t)
-    return frame, lay
-
-
-def divider(text: str) -> QWidget:
-    w = QWidget()
-    h = QHBoxLayout(w)
-    h.setContentsMargins(2, 2, 2, 0)
-    h.setSpacing(10)
-    def line():
-        ln = QFrame()
-        ln.setFrameShape(QFrame.HLine)
-        ln.setObjectName("Divider")
-        ln.setFixedHeight(1)
-        return ln
-    lbl = QLabel(text)
-    lbl.setObjectName("DividerLabel")
-    h.addWidget(line(), 1)
-    h.addWidget(lbl, 0)
-    h.addWidget(line(), 1)
-    return w
-
-
-class CollapseSection(QFrame):
-    def __init__(self, title: str, expanded: bool = True):
+    def __init__(self, title: str, action: QWidget | None = None):
         super().__init__()
-        self.setObjectName("CollapseSection")
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
+        outer.setSpacing(7)
+        head = QHBoxLayout()
+        head.setContentsMargins(2, 0, 2, 0)
+        head.setSpacing(6)
+        lab = QLabel(title)
+        lab.setObjectName("SectionTitle")
+        head.addWidget(lab)
+        head.addStretch(1)
+        if action is not None:
+            head.addWidget(action)
+        outer.addLayout(head)
+        self.body = QVBoxLayout()
+        self.body.setContentsMargins(0, 0, 0, 0)
+        self.body.setSpacing(6)
+        outer.addLayout(self.body)
 
-        self.header = QPushButton()
-        self.header.setObjectName("CollapseHeader")
-        self.header.setCheckable(True)
-        self.header.setChecked(expanded)
-        self.header.setCursor(Qt.PointingHandCursor)
-        self.header.toggled.connect(self.set_expanded)
-        outer.addWidget(self.header)
-
-        self.body = QWidget()
-        self.body.setObjectName("CollapseBody")
-        self.body_lay = QVBoxLayout(self.body)
-        self.body_lay.setContentsMargins(0, 10, 0, 0)
-        self.body_lay.setSpacing(12)
-        outer.addWidget(self.body)
-
-        self.title = title
-        self.set_expanded(expanded)
-
-    def set_expanded(self, expanded: bool):
-        self.body.setVisible(expanded)
-        self.header.setText(("⌄  " if expanded else "›  ") + self.title)
-        self.header.setProperty("expanded", "true" if expanded else "false")
-        self.header.style().unpolish(self.header)
-        self.header.style().polish(self.header)
-
-    def addWidget(self, widget: QWidget):
-        self.body_lay.addWidget(widget)
+    def add(self, w):
+        if isinstance(w, QWidget):
+            self.body.addWidget(w)
+        else:
+            self.body.addLayout(w)
 
 
 class StepRow(QFrame):
-    clicked = Signal(str)
+    """一行步骤：色点(兼图例) + 名称 + 计数 + 序号。"""
 
-    def __init__(self, mode: str):
+    def __init__(self, mode: str, on_click):
         super().__init__()
         self.mode = mode
+        self.on_click = on_click
         self.setObjectName("Step")
-        number, name, hint = MODE_META[mode]
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(12, 10, 12, 10)
-        outer.setSpacing(4)
-        top = QHBoxLayout()
-        top.setSpacing(9)
-        self.badge = QLabel(number)
-        self.badge.setObjectName("StepBadge")
-        self.badge.setFixedSize(22, 22)
-        self.badge.setAlignment(Qt.AlignCenter)
-        self.name = QLabel(name)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip(f"{MODE_META[mode][1]} — {MODE_META[mode][2]}（按 {MODE_META[mode][0]}）")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(8, 5, 9, 5)
+        lay.setSpacing(8)
+
+        self.dot = QLabel()
+        self.dot.setFixedSize(9, 9)
+        self.dot.setStyleSheet(
+            f"background:{ANN[KEY_COLOR[key_of(mode)]]};border-radius:4px;")
+        self.num = QLabel(MODE_META[mode][0])
+        self.num.setObjectName("StepNum")
+        self.name = QLabel(MODE_SHORT[mode])
         self.name.setObjectName("StepName")
         self.count = QLabel("0")
         self.count.setObjectName("StepCount")
-        top.addWidget(self.badge)
-        top.addWidget(self.name, 1)
-        top.addWidget(self.count)
-        self.hint = QLabel(hint)
-        self.hint.setObjectName("StepHint")
-        outer.addLayout(top)
-        outer.addWidget(self.hint)
-        self.setCursor(Qt.PointingHandCursor)
+        lay.addWidget(self.num)
+        lay.addWidget(self.dot)
+        lay.addWidget(self.name, 1)
+        lay.addWidget(self.count)
 
     def mousePressEvent(self, e):
-        self.clicked.emit(self.mode)
+        self.on_click(self.mode)
 
-    def set_state(self, is_active: bool, is_ready: bool, count_text: str, hint_text: str):
+    def set_state(self, active: bool, ready: bool, count_text: str):
         self.count.setText(count_text)
-        self.hint.setText(hint_text)
-        state = "active" if is_active else ("ready" if is_ready else "idle")
+        state = "active" if active else ("ready" if ready else "idle")
         self.setProperty("state", state)
-        self.badge.setProperty("state", state)
-        self.count.setProperty("state", state)
-        self.hint.setProperty("state", state)
-        for w in (self, self.badge, self.count, self.hint):
+        for w in (self, self.num, self.name, self.count):
+            w.setProperty("state", state)
             w.style().unpolish(w)
             w.style().polish(w)
 
 
+class UndoStack:
+    """按图片独立的撤销/重做栈，存 label 的 JSON 快照。"""
+
+    LIMIT = 100
+
+    def __init__(self):
+        self.past: list[str] = []
+        self.future: list[str] = []
+
+    def push(self, label: dict):
+        self.past.append(json.dumps(label, ensure_ascii=False))
+        if len(self.past) > self.LIMIT:
+            self.past.pop(0)
+        self.future.clear()
+
+
 # ============================================================
-#  Main window
+#  主窗口
 # ============================================================
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("IOL Tilt Labeler")
-        self.resize(1500, 940)
+        self.setWindowTitle(APP_NAME)
+        self.resize(1280, 840)
+        self.setMinimumSize(1000, 640)
+        self.setAcceptDrops(True)
 
-        # state
         self.folder: Path | None = None
         self.output_dir: Path | None = None
         self.labels_path: Path | None = None
@@ -425,13 +223,406 @@ class MainWindow(QMainWindow):
         self.original_image = None
         self.mode = "pupil"
         self.step_rows: dict[str, StepRow] = {}
+        self.undo_stacks: dict[str, UndoStack] = {}
+        self._loading = False
 
         self._build_ui()
-        self._install_shortcuts()
-        self._apply_style()
+        self._build_menu()
+        self.apply_theme()
+        app = QApplication.instance()
+        app.installEventFilter(self)
+        try:
+            app.styleHints().colorSchemeChanged.connect(lambda _: self.apply_theme())
+        except (AttributeError, RuntimeError):
+            pass
         self._refresh_all()
 
-    # ---------- data helpers (mirror old logic) ----------
+    # ---------------- 主题 ----------------
+    def is_dark(self) -> bool:
+        forced = os.environ.get("IOL_FORCE_THEME", "")
+        if forced in ("dark", "light"):
+            return forced == "dark"
+        try:
+            return QApplication.instance().styleHints().colorScheme() == Qt.ColorScheme.Dark
+        except (AttributeError, RuntimeError):
+            return False
+
+    def apply_theme(self):
+        c = theme.palette(self.is_dark())
+        self.setStyleSheet(theme.qss(c, FONT_FAMILY, MONO_FAMILY))
+
+    # ---------------- 界面 ----------------
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        root.addWidget(self._build_topbar())
+
+        body = QWidget()
+        body_l = QHBoxLayout(body)
+        body_l.setContentsMargins(0, 0, 0, 0)
+        body_l.setSpacing(0)
+        body_l.addWidget(self._build_sidebar())
+        body_l.addWidget(self._build_canvas_area(), 1)
+        root.addWidget(body, 1)
+
+        root.addWidget(self._build_statusbar())
+
+    # ---- 顶栏 ----
+    def _build_topbar(self) -> QWidget:
+        bar = QWidget()
+        bar.setObjectName("TopBar")
+        bar.setFixedHeight(52)
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(14, 0, 14, 0)
+        h.setSpacing(10)
+
+        mark = QLabel()
+        mark.setPixmap(brand_pixmap(22))
+        mark.setFixedSize(22, 22)
+        name = QLabel("IOL 倾斜标注")
+        name.setObjectName("AppName")
+        h.addWidget(mark)
+        h.addWidget(name)
+
+        sep = QLabel("·")
+        sep.setObjectName("FileMeta")
+        self.file_label = QLabel("未打开图片")
+        self.file_label.setObjectName("FileName")
+        self.index_label = QLabel("")
+        self.index_label.setObjectName("FileMeta")
+        h.addSpacing(4)
+        h.addWidget(sep)
+        h.addWidget(self.file_label)
+        h.addWidget(self.index_label)
+        h.addStretch(1)
+
+        self.btn_open = QPushButton("打开")
+        self.btn_open.setToolTip(f"选择包含 OCT 图片的文件夹（{CMD}O）")
+        self.btn_open.clicked.connect(self.open_folder)
+        self.btn_undo = QPushButton("撤销")
+        self.btn_undo.setToolTip(f"撤销上一步（{CMD}Z）")
+        self.btn_undo.clicked.connect(self.undo)
+        self.btn_prev = QPushButton("‹")
+        self.btn_prev.setFixedWidth(34)
+        self.btn_prev.setToolTip("上一张（P）")
+        self.btn_prev.clicked.connect(self.prev_image)
+        self.btn_next = QPushButton("›")
+        self.btn_next.setFixedWidth(34)
+        self.btn_next.setToolTip("下一张（N）")
+        self.btn_next.clicked.connect(self.next_image)
+        self.btn_save = QPushButton("保存")
+        self.btn_save.setToolTip(f"保存当前结果（{CMD}S）")
+        self.btn_save.clicked.connect(self.save_current)
+        self.btn_save_next = QPushButton("保存并下一张")
+        self.btn_save_next.setObjectName("Primary")
+        self.btn_save_next.setToolTip(f"保存并跳到下一张（{CMD}{ENTER}）")
+        self.btn_save_next.clicked.connect(self.save_and_next)
+
+        for b in (self.btn_open, self.btn_undo, self.btn_prev, self.btn_next,
+                  self.btn_save, self.btn_save_next):
+            b.setCursor(Qt.PointingHandCursor)
+        h.addWidget(self.btn_open)
+        h.addWidget(self.btn_undo)
+        h.addSpacing(6)
+        h.addWidget(self.btn_prev)
+        h.addWidget(self.btn_next)
+        h.addSpacing(6)
+        h.addWidget(self.btn_save)
+        h.addWidget(self.btn_save_next)
+        return bar
+
+    # ---- 左栏 ----
+    def _build_sidebar(self) -> QWidget:
+        wrap = QWidget()
+        wrap.setObjectName("Sidebar")
+        wrap.setFixedWidth(SIDEBAR_WIDTH)
+        col = QVBoxLayout(wrap)
+        col.setContentsMargins(12, 12, 12, 10)
+        col.setSpacing(12)
+
+        col.addWidget(self._build_steps_section())
+        col.addWidget(self._hairline())
+        col.addWidget(self._build_result_section())
+        col.addWidget(self._hairline())
+        col.addWidget(self._build_image_section())
+        col.addWidget(self._build_note_section())
+        col.addWidget(self._hairline())
+        col.addWidget(self._build_files_section(), 1)
+        return wrap
+
+    def _hairline(self) -> QFrame:
+        ln = QFrame()
+        ln.setObjectName("Hairline")
+        ln.setFrameShape(QFrame.HLine)
+        ln.setFixedHeight(1)
+        return ln
+
+    def _build_steps_section(self) -> QWidget:
+        sec = Section("标注步骤")
+        for mode in MODES:
+            row = StepRow(mode, self.set_mode)
+            self.step_rows[mode] = row
+            sec.add(row)
+        return sec
+
+    def _build_result_section(self) -> QWidget:
+        self.btn_copy = QPushButton("复制")
+        self.btn_copy.setObjectName("Quiet")
+        self.btn_copy.setCursor(Qt.PointingHandCursor)
+        self.btn_copy.setToolTip("复制“IOL轴 / A-B / 最终夹角”到剪贴板")
+        self.btn_copy.clicked.connect(self.copy_result)
+        sec = Section("测量结果", self.btn_copy)
+
+        row = QHBoxLayout()
+        row.setSpacing(3)
+        row.setContentsMargins(2, 0, 0, 0)
+        self.result_value = QLabel("—")
+        self.result_value.setObjectName("ResultValue")
+        row.addWidget(self.result_value)
+        row.addStretch(1)
+        sec.add(row)
+
+        self.result_caption = QLabel("完成 A-B 与前/后表面后自动预览")
+        self.result_caption.setObjectName("ResultCaption")
+        self.result_caption.setWordWrap(True)
+        self.result_caption.setContentsMargins(2, 0, 0, 0)
+        sec.add(self.result_caption)
+
+        grid = QGridLayout()
+        grid.setContentsMargins(2, 4, 2, 0)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(3)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
+        self.detail_labels: dict[str, QLabel] = {}
+        specs = [("iol_angle", "IOL 轴"), ("pupil_angle", "A-B"),
+                 ("difference", "有符号差"), ("manual_delta", "校验差"),
+                 ("rms", "拟合 RMS"), ("counts", "前/后点数")]
+        for i, (key, name) in enumerate(specs):
+            r, cpos = divmod(i, 2)
+            k = QLabel(name)
+            k.setObjectName("DetailKey")
+            v = QLabel("—")
+            v.setObjectName("DetailVal")
+            v.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.detail_labels[key] = v
+            grid.addWidget(k, r, cpos * 2)
+            grid.addWidget(v, r, cpos * 2 + 1)
+        sec.add(grid)
+        return sec
+
+    def _build_image_section(self) -> QWidget:
+        self.btn_reset_adjust = QPushButton("复位")
+        self.btn_reset_adjust.setObjectName("Quiet")
+        self.btn_reset_adjust.setCursor(Qt.PointingHandCursor)
+        self.btn_reset_adjust.clicked.connect(self.reset_adjust)
+        sec = Section("图像调节", self.btn_reset_adjust)
+
+        self.slider_bright = QSlider(Qt.Horizontal)
+        self.slider_bright.setRange(-100, 100)
+        self.slider_bright.setToolTip("亮度")
+        self.slider_contrast = QSlider(Qt.Horizontal)
+        self.slider_contrast.setRange(-100, 100)
+        self.slider_contrast.setToolTip("对比度")
+        for s, name in ((self.slider_bright, "亮度"), (self.slider_contrast, "对比度")):
+            s.valueChanged.connect(self.apply_adjust)
+            line = QHBoxLayout()
+            line.setSpacing(8)
+            lab = QLabel(name)
+            lab.setObjectName("DetailKey")
+            lab.setFixedWidth(30)
+            line.addWidget(lab)
+            line.addWidget(s, 1)
+            sec.add(line)
+
+        self.btn_invert = QPushButton("反相显示")
+        self.btn_invert.setCheckable(True)
+        self.btn_invert.setCursor(Qt.PointingHandCursor)
+        self.btn_invert.setToolTip("反相有时更容易看清晶体边界，不影响测量结果")
+        self.btn_invert.toggled.connect(self.apply_adjust)
+        sec.add(self.btn_invert)
+        return sec
+
+    def _build_note_section(self) -> QWidget:
+        sec = Section("病例备注")
+        self.note_edit = QLineEdit()
+        self.note_edit.setPlaceholderText("病例编号 / 术眼 / 备注")
+        self.note_edit.editingFinished.connect(self.save_note)
+        sec.add(self.note_edit)
+        return sec
+
+    def _build_files_section(self) -> QWidget:
+        self.files_count = QLabel("")
+        self.files_count.setObjectName("SectionTitle")
+        sec = Section("图片列表", self.files_count)
+        self.file_list = QListWidget()
+        self.file_list.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        self.file_list.setMinimumHeight(130)
+        self.file_list.setIconSize(QSize(14, 14))
+        self.file_list.currentRowChanged.connect(self.on_file_selected)
+        sec.add(self.file_list)
+        return sec
+
+    # ---- 画布 ----
+    def _build_canvas_area(self) -> QWidget:
+        wrap = QWidget()
+        lay = QVBoxLayout(wrap)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        self.canvas = ImageCanvas()
+        self.canvas.overlay_getter = self.current_label
+        self.canvas.mode_key_getter = lambda: key_of(self.mode)
+        self.canvas.pointClicked.connect(self.on_canvas_click)
+        self.canvas.pointGrabbed.connect(self.on_point_grabbed)
+        self.canvas.pointMoved.connect(self.on_point_moved)
+        self.canvas.pointReleased.connect(self.on_point_released)
+        self.canvas.pointDeleteRequested.connect(self.delete_point)
+        self.canvas.cursorMoved.connect(self.on_cursor_move)
+        self.canvas.viewChanged.connect(self._refresh_status_meta)
+        lay.addWidget(self.canvas)
+
+        self.canvas_bar = self._build_canvas_toolbar(self.canvas)
+        return wrap
+
+    def _build_canvas_toolbar(self, parent: QWidget) -> QWidget:
+        bar = QFrame(parent)
+        bar.setObjectName("CanvasBar")
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(5, 4, 5, 4)
+        h.setSpacing(2)
+
+        def btn(text, tip, slot, checkable=False, width=0):
+            b = QPushButton(text)
+            b.setObjectName("CanvasBtn")
+            b.setToolTip(tip)
+            b.setCheckable(checkable)
+            b.setCursor(Qt.PointingHandCursor)
+            b.clicked.connect(slot)
+            if width:
+                b.setFixedWidth(width)
+            h.addWidget(b)
+            return b
+
+        btn("−", f"缩小（{CMD}-）", lambda: self.canvas.zoom_by(1 / 1.2), width=28)
+        self.zoom_label = QLabel("100%")
+        self.zoom_label.setObjectName("CanvasZoom")
+        self.zoom_label.setAlignment(Qt.AlignCenter)
+        self.zoom_label.setFixedWidth(46)
+        h.addWidget(self.zoom_label)
+        btn("+", f"放大（{CMD}+）", lambda: self.canvas.zoom_by(1.2), width=28)
+        h.addWidget(self._vsep())
+        btn("适配", f"适配窗口（{CMD}0）", self.canvas.fit)
+        btn("1:1", f"实际像素（{CMD}1）", self.canvas.actual_size)
+        h.addWidget(self._vsep())
+        self.btn_loupe = btn("放大镜", f"光标处放大镜（{CMD}L）", self.toggle_loupe, checkable=True)
+        self.btn_loupe.setChecked(True)
+        self.btn_cross = btn("准星", f"十字准星（{CMD}K）", self.toggle_crosshair, checkable=True)
+        bar.adjustSize()
+        return bar
+
+    def _vsep(self) -> QWidget:
+        w = QFrame()
+        w.setObjectName("CanvasSep")
+        w.setFixedWidth(1)
+        w.setFixedHeight(16)
+        return w
+
+    def _build_statusbar(self) -> QWidget:
+        bar = QWidget()
+        bar.setObjectName("StatusBar")
+        bar.setFixedHeight(26)
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(14, 0, 14, 0)
+        h.setSpacing(14)
+        self.status_text = QLabel("准备就绪")
+        self.status_text.setObjectName("StatusText")
+        self.status_meta = QLabel("")
+        self.status_meta.setObjectName("StatusMeta")
+        h.addWidget(self.status_text, 1)
+        h.addWidget(self.status_meta)
+        return bar
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._place_canvas_bar()
+
+    def _place_canvas_bar(self):
+        if hasattr(self, "canvas_bar"):
+            self.canvas_bar.adjustSize()
+            self.canvas_bar.move(self.canvas.width() - self.canvas_bar.width() - 14, 12)
+            self.canvas_bar.raise_()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        QTimer.singleShot(0, self._place_canvas_bar)
+        QTimer.singleShot(0, self.canvas.setFocus)
+
+    # ---------------- 菜单 ----------------
+    def _act(self, menu, text, shortcut, slot, checkable=False):
+        a = QAction(text, self)
+        if shortcut:
+            a.setShortcut(QKeySequence(shortcut))
+        a.setCheckable(checkable)
+        a.triggered.connect(slot)
+        menu.addAction(a)
+        return a
+
+    def _build_menu(self):
+        mb = self.menuBar()
+        m = mb.addMenu("文件")
+        self._act(m, "打开文件夹…", "Ctrl+O", self.open_folder)
+        self._act(m, "打开图片…", "Ctrl+Shift+O", self.open_files)
+        m.addSeparator()
+        self._act(m, "保存当前", "Ctrl+S", self.save_current)
+        self._act(m, "保存并下一张", "Ctrl+Return", self.save_and_next)
+        m.addSeparator()
+        self._act(m, "打开 Excel", "Ctrl+E", self.open_excel)
+        self._act(m, "打开输出文件夹", "Ctrl+Shift+E", self.open_output_folder)
+
+        m = mb.addMenu("编辑")
+        self.act_undo = self._act(m, "撤销", QKeySequence.Undo, self.undo)
+        self.act_redo = self._act(m, "重做", QKeySequence.Redo, self.redo)
+        m.addSeparator()
+        self._act(m, "删除选中点", "Backspace", self.delete_selected)
+        self._act(m, "清空当前步骤", "", self.clear_current_mode)
+        self._act(m, "清空本图全部点位…", "", self.clear_all_points)
+
+        m = mb.addMenu("视图")
+        self._act(m, "放大", "Ctrl++", lambda: self.canvas.zoom_by(1.2))
+        self._act(m, "缩小", "Ctrl+-", lambda: self.canvas.zoom_by(1 / 1.2))
+        self._act(m, "适配窗口", "Ctrl+0", self.canvas.fit)
+        self._act(m, "实际像素", "Ctrl+1", self.canvas.actual_size)
+        m.addSeparator()
+        self.act_loupe = self._act(m, "放大镜", "Ctrl+L", self.toggle_loupe_menu, checkable=True)
+        self.act_loupe.setChecked(True)
+        self.act_cross = self._act(m, "十字准星", "Ctrl+K", self.toggle_crosshair_menu, checkable=True)
+        m.addSeparator()
+        self._act(m, "上一张", "Ctrl+Left", self.prev_image)
+        self._act(m, "下一张", "Ctrl+Right", self.next_image)
+
+        m = mb.addMenu("步骤")
+        group = QActionGroup(self)
+        self.mode_actions = {}
+        for mode in MODES:
+            a = QAction(f"{MODE_META[mode][0]}. {MODE_SHORT[mode]}", self)
+            a.setCheckable(True)
+            a.setShortcut(QKeySequence(f"Ctrl+{MODE_META[mode][0]}"))
+            a.triggered.connect(lambda _=False, md=mode: self.set_mode(md))
+            group.addAction(a)
+            m.addAction(a)
+            self.mode_actions[mode] = a
+
+        m = mb.addMenu("帮助")
+        self._act(m, "快捷键与用法", "", self.show_help)
+        self._act(m, "生成校准测试图", "", self.gen_calibration)
+        self._act(m, f"关于 {APP_NAME}", "", self.show_about)
+
+    # ---------------- 数据 ----------------
     def build_image_keys(self):
         counts: dict[str, int] = {}
         for image in self.images:
@@ -461,6 +652,14 @@ class MainWindow(QMainWindow):
         self.labels.setdefault(self.image_key(path), default_label())
         return self.labels[self.image_key(path)]
 
+    def current_stack(self) -> UndoStack:
+        path = self.current_image_path()
+        key = self.image_key(path) if path else "__none__"
+        return self.undo_stacks.setdefault(key, UndoStack())
+
+    def push_undo(self):
+        self.current_stack().push(self.current_label())
+
     def load_labels(self):
         self.labels = {}
         if self.labels_path and self.labels_path.exists():
@@ -479,12 +678,15 @@ class MainWindow(QMainWindow):
     def save_labels_json(self):
         if not self.labels_path:
             return
-        atomic_write_text(self.labels_path, json.dumps(self.labels, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_text(self.labels_path,
+                          json.dumps(self.labels, ensure_ascii=False, indent=2),
+                          encoding="utf-8")
 
     def export_tables_if_exists(self):
         if self.output_dir is None:
             return
-        if (self.output_dir / "iol_tilt_results.csv").exists() or (self.output_dir / "iol_tilt_results.xlsx").exists():
+        if ((self.output_dir / "iol_tilt_results.csv").exists()
+                or (self.output_dir / "iol_tilt_results.xlsx").exists()):
             self.export_tables()
 
     def invalidate_result(self, reason: str):
@@ -493,415 +695,193 @@ class MainWindow(QMainWindow):
         try:
             self.export_tables_if_exists()
         except Exception as exc:
-            self.set_status(f"{reason}；但刷新表格失败：{exc}")
+            self.set_status(f"{reason}；刷新表格失败：{exc}")
             return
         self.set_status(reason)
 
-    # ---------- UI construction ----------
-    def _build_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        root = QVBoxLayout(central)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
-
-        root.addWidget(self._build_topbar())
-
-        body = QWidget()
-        body_l = QHBoxLayout(body)
-        body_l.setContentsMargins(16, 16, 16, 16)
-        body_l.setSpacing(16)
-        body_l.addWidget(self._build_left(), 0)
-        body_l.addWidget(self._build_canvas_panel(), 1)
-        root.addWidget(body, 1)
-
-    def _install_shortcuts(self):
-        undo_action = QAction(self)
-        undo_action.setShortcut(QKeySequence.Undo)
-        undo_action.triggered.connect(self.undo_shortcut)
-        self.addAction(undo_action)
-
-    def _build_topbar(self) -> QWidget:
-        bar = QWidget()
-        bar.setObjectName("TopBar")
-        h = QHBoxLayout(bar)
-        h.setContentsMargins(22, 14, 24, 10)
-        h.setSpacing(14)
-
-        mark = QLabel()
-        mark.setFixedSize(38, 38)
-        mark.setObjectName("BrandMark")
-        mark.setPixmap(self._brand_pixmap())
-
-        h.addWidget(mark)
-
-        self.status_label = QLabel("")
-        self.status_label.setObjectName("StatusText")
-        self.status_label.hide()
-
-        h.addStretch(1)
-
-        self.btn_excel = QPushButton("打开 Excel")
-        self.btn_finder = QPushButton("在 Finder 中显示")
-        self.btn_savenext_top = QPushButton("保存并下一张")
-        for b in (self.btn_excel, self.btn_finder):
-            b.setObjectName("Secondary")
-        self.btn_savenext_top.setObjectName("Primary")
-        self.btn_excel.clicked.connect(self.open_excel)
-        self.btn_finder.clicked.connect(self.open_output_folder)
-        self.btn_savenext_top.clicked.connect(self.save_and_next)
-        buttons_box = QVBoxLayout()
-        buttons_box.setContentsMargins(0, 0, 0, 0)
-        buttons_box.addStretch(1)
-        buttons_row = QHBoxLayout()
-        buttons_row.setSpacing(14)
-        buttons_row.addWidget(self.btn_excel)
-        buttons_row.addWidget(self.btn_finder)
-        buttons_row.addWidget(self.btn_savenext_top)
-        buttons_box.addLayout(buttons_row)
-        h.addLayout(buttons_box)
-        return bar
-
-    def _brand_pixmap(self) -> QPixmap:
-        pm = QPixmap(38, 38)
-        pm.fill(Qt.transparent)
-        p = QPainter(pm)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        grad = QLinearGradient(0, 0, 38, 38)
-        grad.setColorAt(0, QColor(C["accent1"]))
-        grad.setColorAt(1, QColor(C["accent2"]))
-        path = QPainterPath()
-        path.addRoundedRect(0, 0, 38, 38, 11, 11)
-        p.fillPath(path, QBrush(grad))
-        p.setPen(QPen(QColor(255, 255, 255, 72), 1.1))
-        p.drawEllipse(8, 8, 22, 22)
-        p.drawEllipse(13, 13, 12, 12)
-        p.drawLine(7, 19, 31, 19)
-        p.drawLine(19, 7, 19, 31)
-        p.setPen(QColor(255, 255, 255))
-        f = QFont(FONT_FAMILY, 10)
-        f.setBold(True)
-        p.setFont(f)
-        p.drawText(pm.rect(), Qt.AlignCenter, "LOL")
-        p.end()
-        return pm
-
-    def _build_left(self) -> QWidget:
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setObjectName("LeftScroll")
-        scroll.setFixedWidth(446)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-
-        inner = QWidget()
-        col = QVBoxLayout(inner)
-        col.setContentsMargins(2, 0, 8, 0)
-        col.setSpacing(12)
-
-        col.addWidget(self._build_result_card())
-
-        start = CollapseSection("开始 / 导航", expanded=True)
-        start.addWidget(self._build_start_card())
-        col.addWidget(start)
-
-        workflow = CollapseSection("标注工作流", expanded=True)
-        workflow.addWidget(self._build_workflow_card())
-        col.addWidget(workflow)
-
-        save = CollapseSection("保存 / 备注 / 明细", expanded=False)
-        save.addWidget(self._build_save_card())
-        save.addWidget(self._build_note_card())
-        save.addWidget(self._build_detail_card())
-        col.addWidget(save)
-
-        tools = CollapseSection("视图 / 图例 / 编辑", expanded=False)
-        tools.addWidget(self._build_view_card())
-        tools.addWidget(self._build_legend_card())
-        tools.addWidget(self._build_edit_card())
-        col.addWidget(tools)
-
-        foot = QLabel("快捷键：⌘Z 撤销 · S 保存 · P/N 切图 · 5 自动轴校验")
-        foot.setObjectName("Footnote")
-        foot.setAlignment(Qt.AlignCenter)
-        col.addWidget(foot)
-        col.addStretch(1)
-
-        scroll.setWidget(inner)
-        return scroll
-
-    def _build_result_card(self) -> QWidget:
-        frame = QFrame()
-        frame.setObjectName("ResultCard")
-        lay = QVBoxLayout(frame)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
-
-        pad = QVBoxLayout()
-        pad.setContentsMargins(18, 16, 18, 16)
-        pad.setSpacing(4)
-        lab = QLabel("FINAL TILT 最终倾斜角")
-        lab.setObjectName("ResultLabel")
-        self.result_value = QLabel("--")
-        self.result_value.setObjectName("ResultValue")
-        self.result_caption = QLabel("点完 A/B、前/后表面，生成自动轴后计算差值")
-        self.result_caption.setObjectName("ResultCaption")
-        self.result_caption.setWordWrap(True)
-        pad.addWidget(lab)
-        pad.addWidget(self.result_value)
-        pad.addWidget(self.result_caption)
-
-        chips = QHBoxLayout()
-        chips.setSpacing(8)
-        self.chip_dir = QLabel("方向 --")
-        self.chip_quality = QLabel("质量 --")
-        self.chip_axis = QLabel("轴 --")
-        self.chip_dir.setObjectName("ChipBlue")
-        self.chip_quality.setObjectName("ChipGreen")
-        self.chip_axis.setObjectName("ChipPurple")
-        for c in (self.chip_dir, self.chip_quality, self.chip_axis):
-            chips.addWidget(c)
-        chips.addStretch(1)
-        pad.addLayout(chips)
-        lay.addLayout(pad)
-        return frame
-
-    def _mk_btn(self, text, kind="Secondary", slot=None):
-        b = QPushButton(text)
-        b.setObjectName(kind)
-        b.setCursor(Qt.PointingHandCursor)
-        if slot:
-            b.clicked.connect(slot)
-        return b
-
-    def _build_start_card(self) -> QWidget:
-        frame, lay = card("开始工作")
-        r1 = QHBoxLayout(); r1.setSpacing(8)
-        r1.addWidget(self._mk_btn("选择文件夹", "Primary", self.open_folder), 3)
-        r1.addWidget(self._mk_btn("打开图片", "Secondary", self.open_files), 2)
-        r2 = QHBoxLayout(); r2.setSpacing(8)
-        r2.addWidget(self._mk_btn("← 上一张 P", "Secondary", self.prev_image))
-        r2.addWidget(self._mk_btn("下一张 N →", "Secondary", self.next_image))
-        lay.addLayout(r1)
-        lay.addLayout(r2)
-        return frame
-
-    def _build_workflow_card(self) -> QWidget:
-        frame, lay = card("标注工作流")
-        desc = QLabel("按 1–5 切换步骤。先完成 A-B，再标前/后表面生成自动轴；第 5 步可点 2 个参考点校验自动轴。")
-        desc.setObjectName("Muted")
-        desc.setWordWrap(True)
-        lay.addWidget(desc)
-        for mode in ("guide", "pupil", "anterior", "posterior", "manual_axis"):
-            row = StepRow(mode)
-            row.clicked.connect(self.set_mode)
-            self.step_rows[mode] = row
-            lay.addWidget(row)
-        return frame
-
-    def _build_save_card(self) -> QWidget:
-        frame, lay = card("保存")
-        r = QHBoxLayout(); r.setSpacing(8)
-        r.addWidget(self._mk_btn("保存当前 S", "Secondary", self.save_current))
-        r.addWidget(self._mk_btn("保存并下一张", "Primary", self.save_and_next))
-        lay.addLayout(r)
-        return frame
-
-    def _build_note_card(self) -> QWidget:
-        frame, lay = card("病例备注")
-        self.note_edit = QLineEdit()
-        self.note_edit.setPlaceholderText("可填写病例编号、术眼、备注…")
-        self.note_edit.setObjectName("Note")
-        self.note_edit.editingFinished.connect(self.save_note)
-        lay.addWidget(self.note_edit)
-        hint = QLabel("切图时会自动保存备注。")
-        hint.setObjectName("Muted")
-        lay.addWidget(hint)
-        return frame
-
-    def _build_detail_card(self) -> QWidget:
-        frame, lay = card("点位与计算明细")
-        self.detail_grid = QGridLayout()
-        self.detail_grid.setHorizontalSpacing(12)
-        self.detail_grid.setVerticalSpacing(2)
-        self.detail_labels: dict[str, QLabel] = {}
-        specs = [
-            ("iol_angle", "当前 IOL 角度"), ("auto_iol_angle", "自动轴角度"), ("pupil_angle", "A-B 角度"),
-            ("difference", "有符号差"), ("final_angle", "最终差值"), ("axis", "当前轴来源"),
-            ("front_rms", "前表面 RMS"), ("back_rms", "后表面 RMS"), ("manual_delta", "自动轴校验差"),
-            ("counts", "前/后点数"),
-        ]
-        for i, (key, name) in enumerate(specs):
-            r, cpos = divmod(i, 3)
-            box = QVBoxLayout(); box.setSpacing(0)
-            k = QLabel(name); k.setObjectName("DetailKey")
-            v = QLabel("--"); v.setObjectName("DetailVal")
-            self.detail_labels[key] = v
-            box.addWidget(k); box.addWidget(v)
-            wrap = QWidget(); wrap.setLayout(box)
-            self.detail_grid.addWidget(wrap, r, cpos)
-        lay.addLayout(self.detail_grid)
-
-        self.points_box = QPlainTextEdit()
-        self.points_box.setReadOnly(True)
-        self.points_box.setObjectName("PointsBox")
-        self.points_box.setFixedHeight(150)
-        lay.addWidget(self.points_box)
-        return frame
-
-    def _build_view_card(self) -> QWidget:
-        frame, lay = card("视图缩放")
-        seg = QFrame()
-        seg.setObjectName("Segmented")
-        sl = QHBoxLayout(seg)
-        sl.setContentsMargins(4, 4, 4, 4)
-        sl.setSpacing(4)
-        for text, slot in [("缩小", lambda: self.zoom_step(1/1.2)),
-                            ("适配", self.fit_zoom),
-                            ("放大", lambda: self.zoom_step(1.2))]:
-            b = QPushButton(text)
-            b.setObjectName("SegBtn")
-            b.setCursor(Qt.PointingHandCursor)
-            b.clicked.connect(slot)
-            sl.addWidget(b)
-        lay.addWidget(seg)
-        return frame
-
-    def _build_legend_card(self) -> QWidget:
-        frame, lay = card("颜色图例")
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(16)
-        grid.setVerticalSpacing(9)
-        items = [
-            ("pupil", "A-B 瞳孔平面"), ("iol", "自动 IOL 轴"),
-            ("anterior", "晶体前表面"), ("manual", "自动轴校验"),
-            ("posterior", "晶体后表面"),
-        ]
-        for i, (key, name) in enumerate(items):
-            r, cpos = divmod(i, 2)
-            row = QHBoxLayout(); row.setSpacing(9)
-            dot = QLabel(); dot.setFixedSize(11, 11)
-            dot.setStyleSheet(f"background:{ANN[key]};border-radius:5px;")
-            txt = QLabel(name); txt.setObjectName("LegendText")
-            row.addWidget(dot); row.addWidget(txt, 1)
-            wrap = QWidget(); wrap.setLayout(row)
-            grid.addWidget(wrap, r, cpos)
-        lay.addLayout(grid)
-        return frame
-
-    def _build_edit_card(self) -> QWidget:
-        frame, lay = card("编辑")
-        r = QHBoxLayout(); r.setSpacing(8)
-        r.addWidget(self._mk_btn("撤销 U", "Secondary", self.undo))
-        r.addWidget(self._mk_btn("清空当前", "Secondary", self.clear_current_mode))
-        lay.addLayout(r)
-        lay.addWidget(self._mk_btn("清空本图全部点位…", "Danger", self.clear_all_points))
-        return frame
-
-    def _build_canvas_panel(self) -> QWidget:
-        frame = QFrame()
-        frame.setObjectName("CanvasCard")
-        lay = QVBoxLayout(frame)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
-
-        head = QWidget()
-        head.setObjectName("CanvasHead")
-        hl = QHBoxLayout(head)
-        hl.setContentsMargins(16, 12, 16, 12)
-        title = QLabel("影像标注")
-        title.setObjectName("CanvasTitle")
-        info = QLabel("左键取点 · 右键/中键平移 · 滚轮缩放")
-        info.setObjectName("CanvasInfo")
-        self.cursor_label = QLabel("")
-        self.cursor_label.setObjectName("CursorLabel")
-        hl.addWidget(title)
-        hl.addWidget(info)
-        hl.addStretch(1)
-        hl.addWidget(self.cursor_label)
-        lay.addWidget(head)
-
-        self.canvas = ImageCanvas()
-        self.canvas.overlay_getter = self.current_label
-        self.canvas.pointClicked.connect(self.on_canvas_click)
-        self.canvas.cursorMoved.connect(self.on_cursor_move)
-        lay.addWidget(self.canvas, 1)
-        return frame
-
-    # ---------- interactions ----------
+    # ---------------- 交互 ----------------
     def set_status(self, text: str):
-        self.status_label.setText(text)
+        self.status_text.setText(text)
 
     def set_mode(self, mode: str):
         self.mode = mode
+        if mode in self.mode_actions:
+            self.mode_actions[mode].setChecked(True)
+        self.canvas.selected = None
         self._refresh_steps()
+        self.canvas.update()
 
     def on_cursor_move(self, x, y):
-        self.cursor_label.setText(f"x={x:.1f}, y={y:.1f} · zoom {self.canvas.scale:.2f}×")
+        self._cursor_xy = (x, y)
+        self._refresh_status_meta()
+
+    def _refresh_status_meta(self):
+        parts = []
+        xy = getattr(self, "_cursor_xy", None)
+        if xy and self.images:
+            parts.append(f"x {xy[0]:.0f}  y {xy[1]:.0f}")
+        if self.images:
+            parts.append(f"{self.canvas.scale * 100:.0f}%")
+            parts.append(f"已完成 {self.done_count()}/{len(self.images)}")
+        self.status_meta.setText("     ".join(parts))
+        if hasattr(self, "zoom_label"):
+            self.zoom_label.setText(f"{self.canvas.scale * 100:.0f}%")
+
+    def done_count(self) -> int:
+        return sum(1 for img in self.images
+                   if (self.labels.get(self.image_key(img)) or {}).get("result"))
 
     def on_canvas_click(self, x, y):
+        if not self.images:
+            return
         label = self.current_label()
-        mode = self.mode
-        if mode == "pupil" and len(label["pupil_plane"]) >= 2:
-            self.set_status("A-B 已有 2 个点；如需重取，先点“清空当前”")
+        key = key_of(self.mode)
+        limit = MAX_POINTS[self.mode]
+        if len(label.get(key, [])) >= limit:
+            self.set_status(f"{MODE_SHORT[self.mode]} 最多 {limit} 个点；拖动已有点可微调，⌥点击可删除")
             return
-        if mode == "anterior" and len(label["anterior"]) >= 8:
-            self.set_status("前表面最多先放 8 个点；推荐 4 个")
-            return
-        if mode == "posterior" and len(label["posterior"]) >= 12:
-            self.set_status("后表面点过多；建议 4-8 个")
-            return
-        if mode == "manual_axis" and len(label.get("manual_iol_axis", [])) >= 2:
-            self.set_status("自动轴校验点已有 2 个；如需重取，先点“清空当前”")
-            return
-        key = label_key_for_mode(mode)
+        self.push_undo()
         label.setdefault(key, [])
         label[key].append([round(x, 3), round(y, 3)])
-        self.invalidate_result("点位已修改，当前结果需重新保存")
+        self.canvas.selected = (key, len(label[key]) - 1)
+        self.invalidate_result(f"已添加 {MODE_SHORT[self.mode]} 第 {len(label[key])} 点")
+        self.canvas.update()
+        self._refresh_side()
+        # A-B 点满自动进入下一步，少点一次
+        if self.mode == "pupil" and len(label[key]) == 2:
+            self.set_mode("anterior")
+
+    def on_point_grabbed(self, key: str, idx: int):
+        self.push_undo()
+        self._drag_dirty = False
+
+    def on_point_moved(self, key: str, idx: int, x: float, y: float):
+        label = self.current_label()
+        pts = label.get(key)
+        if not pts or idx >= len(pts):
+            return
+        pts[idx] = [round(x, 3), round(y, 3)]
+        self._drag_dirty = True
+        self._refresh_side(light=True)
+
+    def on_point_released(self):
+        if getattr(self, "_drag_dirty", False):
+            self.invalidate_result("已移动点位，需重新保存")
+            self._refresh_side()
+        else:
+            # 只是点了一下没真拖动，撤销栈不留空快照
+            stack = self.current_stack()
+            if stack.past:
+                stack.past.pop()
+        self._drag_dirty = False
+
+    def delete_point(self, key: str, idx: int):
+        label = self.current_label()
+        pts = label.get(key)
+        if not pts or idx >= len(pts):
+            return
+        self.push_undo()
+        removed = pts.pop(idx)
+        self.canvas.selected = None
+        self.invalidate_result(f"已删除点 {fmt_point(tuple(removed))}")
         self.canvas.update()
         self._refresh_side()
 
-    def undo_shortcut(self):
-        if isinstance(self.focusWidget(), (QLineEdit, QPlainTextEdit)):
-            return
-        self.undo()
+    def delete_selected(self):
+        if self.canvas.selected:
+            self.delete_point(*self.canvas.selected)
+        else:
+            self.set_status("先点选一个点，再按 Delete 删除")
+
+    def nudge_selected(self, dx: float, dy: float):
+        if not self.canvas.selected:
+            return False
+        key, idx = self.canvas.selected
+        pts = self.current_label().get(key)
+        if not pts or idx >= len(pts):
+            return False
+        self.push_undo()
+        pts[idx] = [round(pts[idx][0] + dx, 3), round(pts[idx][1] + dy, 3)]
+        self.invalidate_result(f"已微调点位 {fmt_point(tuple(pts[idx]))}")
+        self.canvas.update()
+        self._refresh_side()
+        return True
 
     def undo(self):
-        label = self.current_label()
-        key = label_key_for_mode(self.mode)
-        if label.get(key):
-            removed = label[key].pop()
-            self.invalidate_result(f"已撤销 {self.mode} 点 {fmt_point(tuple(removed))}")
-            self.canvas.update()
-            self._refresh_side()
-        else:
-            self.set_status(f"当前模式 {self.mode} 没有可撤销点")
+        stack = self.current_stack()
+        if not stack.past:
+            self.set_status("没有可撤销的操作")
+            return
+        path = self.current_image_path()
+        if path is None:
+            return
+        key = self.image_key(path)
+        stack.future.append(json.dumps(self.labels.get(key, default_label()), ensure_ascii=False))
+        self.labels[key] = json.loads(stack.past.pop())
+        self.canvas.selected = None
+        self.note_edit.setText(str(self.labels[key].get("note", "")))
+        self.save_labels_json()
+        self.export_tables_if_exists()
+        self.set_status("已撤销")
+        self.canvas.update()
+        self._refresh_all()
+
+    def redo(self):
+        stack = self.current_stack()
+        if not stack.future:
+            self.set_status("没有可重做的操作")
+            return
+        path = self.current_image_path()
+        if path is None:
+            return
+        key = self.image_key(path)
+        stack.past.append(json.dumps(self.labels.get(key, default_label()), ensure_ascii=False))
+        self.labels[key] = json.loads(stack.future.pop())
+        self.canvas.selected = None
+        self.note_edit.setText(str(self.labels[key].get("note", "")))
+        self.save_labels_json()
+        self.export_tables_if_exists()
+        self.set_status("已重做")
+        self.canvas.update()
+        self._refresh_all()
 
     def clear_current_mode(self):
+        if not self.images:
+            return
         label = self.current_label()
-        key = label_key_for_mode(self.mode)
-        if QMessageBox.question(self, "确认", f"清空当前模式 {self.mode} 的点？") == QMessageBox.Yes:
-            label[key] = []
-            self.invalidate_result(f"已清空 {self.mode} 点位")
-            self.canvas.update()
-            self._refresh_side()
+        key = key_of(self.mode)
+        if not label.get(key):
+            self.set_status(f"{MODE_SHORT[self.mode]} 本来就没有点")
+            return
+        if QMessageBox.question(self, "清空当前步骤",
+                                f"清空「{MODE_SHORT[self.mode]}」的全部点？") != QMessageBox.Yes:
+            return
+        self.push_undo()
+        label[key] = []
+        self.canvas.selected = None
+        self.invalidate_result(f"已清空 {MODE_SHORT[self.mode]}")
+        self.canvas.update()
+        self._refresh_all()
 
     def clear_all_points(self):
         if not self.images:
             return
-        if QMessageBox.question(self, "确认", "清空本图所有点位和结果？") != QMessageBox.Yes:
+        if QMessageBox.question(self, "清空本图", "清空这张图的所有点位和结果？") != QMessageBox.Yes:
             return
+        self.push_undo()
         path = self.current_image_path()
         self.labels[self.image_key(path)] = default_label()
         self.note_edit.setText("")
+        self.canvas.selected = None
         self.save_labels_json()
         try:
             self.export_tables_if_exists()
         except Exception as exc:
             self.set_status(f"已清空；刷新表格失败：{exc}")
         else:
-            self.set_status("已清空本图全部点位，需重新保存")
+            self.set_status("已清空本图全部点位")
         self.canvas.update()
-        self._refresh_side()
+        self._refresh_all()
 
     def save_note(self):
         if not self.images:
@@ -909,14 +889,55 @@ class MainWindow(QMainWindow):
         self.current_label()["note"] = self.note_edit.text()
         self.save_labels_json()
 
-    # ---------- folder / images ----------
+    def copy_result(self):
+        label = self.current_label()
+        result = label.get("result") or self._preview_result(label)
+        if not result:
+            self.set_status("还没有可复制的结果")
+            return
+        text = (f"IOL轴角度 {fmt_number(result.get('iol_angle'))}°\t"
+                f"A-B角度 {fmt_number(result.get('pupil_angle'))}°\t"
+                f"最终夹角 {final_angle_text(result)}°")
+        QApplication.clipboard().setText(text)
+        self.set_status("结果已复制到剪贴板")
+
+    # ---------------- 图像调节 ----------------
+    def apply_adjust(self):
+        self.canvas.set_adjust(self.slider_bright.value(),
+                               self.slider_contrast.value(),
+                               self.btn_invert.isChecked())
+
+    def reset_adjust(self):
+        self.slider_bright.setValue(0)
+        self.slider_contrast.setValue(0)
+        self.btn_invert.setChecked(False)
+
+    def toggle_loupe(self):
+        self.canvas.show_loupe = self.btn_loupe.isChecked()
+        self.act_loupe.setChecked(self.canvas.show_loupe)
+        self.canvas.update()
+
+    def toggle_loupe_menu(self):
+        self.btn_loupe.setChecked(self.act_loupe.isChecked())
+        self.toggle_loupe()
+
+    def toggle_crosshair(self):
+        self.canvas.show_crosshair = self.btn_cross.isChecked()
+        self.act_cross.setChecked(self.canvas.show_crosshair)
+        self.canvas.update()
+
+    def toggle_crosshair_menu(self):
+        self.btn_cross.setChecked(self.act_cross.isChecked())
+        self.toggle_crosshair()
+
+    # ---------------- 打开 / 切换 ----------------
     def open_folder(self):
         selected = QFileDialog.getExistingDirectory(self, "选择包含 OCT 图片的文件夹")
         if not selected:
             return
-        self.folder = Path(selected)
-        images = sorted(p for p in self.folder.iterdir() if p.suffix.lower() in SUPPORTED_EXTS)
-        self.start_session(images, self.folder)
+        folder = Path(selected)
+        images = sorted(p for p in folder.iterdir() if p.suffix.lower() in SUPPORTED_EXTS)
+        self.start_session(images, folder)
 
     def open_files(self):
         files, _ = QFileDialog.getOpenFileNames(
@@ -926,18 +947,19 @@ class MainWindow(QMainWindow):
             return
         images = sorted(Path(p) for p in files if Path(p).suffix.lower() in SUPPORTED_EXTS)
         if not images:
-            QMessageBox.warning(self, "没有图片", "没有选中 jpg/png/tif/bmp 图片")
+            QMessageBox.warning(self, "没有图片", "没有选中 jpg / png / tif / bmp 图片")
             return
-        self.folder = images[0].parent
-        self.start_session(images, self.folder)
+        self.start_session(images, images[0].parent)
 
     def start_session(self, images: list[Path], output_base: Path):
-        self.images = images
-        if not self.images:
-            QMessageBox.warning(self, "没有图片", "这里没有 jpg/png/tif/bmp 图片")
-            self.set_status("没有找到图片，未创建输出目录")
+        if not images:
+            QMessageBox.warning(self, "没有图片", "这里没有 jpg / png / tif / bmp 图片")
+            self.set_status("没有找到图片")
             return
+        self.folder = output_base
+        self.images = images
         self.build_image_keys()
+        self.undo_stacks = {}
         self.output_dir = output_base / "IOL_Tilt_Output"
         try:
             self.output_dir.mkdir(exist_ok=True)
@@ -948,6 +970,44 @@ class MainWindow(QMainWindow):
         self.labels_path = self.output_dir / "labels.json"
         self.load_labels()
         self.index = 0
+        self._rebuild_file_list()
+        self.load_current_image(fit=True)
+        self.set_status(f"已载入 {len(images)} 张图片 · 结果写入 {self.output_dir.name}/")
+
+    def _rebuild_file_list(self):
+        self._loading = True
+        self.file_list.clear()
+        for image in self.images:
+            item = QListWidgetItem(image.name)
+            item.setToolTip(str(image))
+            self.file_list.addItem(item)
+        self.file_list.setCurrentRow(self.index)
+        self._loading = False
+        self._refresh_file_list_state()
+
+    def _refresh_file_list_state(self):
+        if self.file_list.count() != len(self.images):
+            return
+        for i, image in enumerate(self.images):
+            label = self.labels.get(self.image_key(image), {})
+            has_points = any(label.get(k) for k in
+                             ("guide", "pupil_plane", "anterior", "posterior", "manual_iol_axis"))
+            if label.get("result"):
+                color, tip = "#30d158", "已保存"
+            elif has_points:
+                color, tip = "#ff9f0a", "标注中，未保存"
+            else:
+                color, tip = "#8e8e93", "未开始"
+            item = self.file_list.item(i)
+            item.setIcon(dot_icon(color))
+            item.setToolTip(f"{image.name}\n{tip}")
+        self.files_count.setText(f"{self.done_count()}/{len(self.images)} 已完成")
+
+    def on_file_selected(self, row: int):
+        if self._loading or row < 0 or row >= len(self.images) or row == self.index:
+            return
+        self.save_note()
+        self.index = row
         self.load_current_image(fit=True)
 
     def load_current_image(self, fit=False):
@@ -960,10 +1020,15 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "打开图片失败", f"{path}\n{exc}")
             return
+        self.canvas.selected = None
         self.canvas.set_image(self.original_image)
         self.note_edit.setText(str(self.current_label().get("note", "")))
         if fit:
             self.canvas.fit()
+        self._loading = True
+        self.file_list.setCurrentRow(self.index)
+        self._loading = False
+        self.setWindowTitle(f"{path.name} — {APP_NAME}")
         self._refresh_all()
 
     def prev_image(self):
@@ -986,53 +1051,55 @@ class MainWindow(QMainWindow):
         self.index += 1
         self.load_current_image(fit=True)
 
-    def fit_zoom(self):
-        self.canvas.fit()
-        self._refresh_progress()
+    # ---------------- 计算 / 保存 ----------------
+    def _preview_result(self, label) -> dict | None:
+        try:
+            return compute_result(label)
+        except Exception:
+            return None
 
-    def zoom_step(self, factor):
-        self.canvas.set_zoom(self.canvas.scale * factor)
-        self._refresh_progress()
-
-    # ---------- compute / save ----------
     def save_current(self) -> bool:
         if self.original_image is None or self.output_dir is None:
+            self.set_status("先打开图片再保存")
             return False
         path = self.current_image_path()
         if path is None:
             return False
         try:
-            result = compute_result(self.current_label())
             label = self.current_label()
+            result = compute_result(label)
             result["annotated_file"] = ""
-            annotated = save_annotated_image(self.output_dir, self.output_stem(path), path, label, result)
-            result["annotated_file"] = str(annotated)
+            annotated = save_annotated_image(self.output_dir, self.output_stem(path),
+                                             path, label, result)
+            result["annotated_file"] = str(annotated) if annotated else ""
             label["result"] = result
             label["note"] = self.note_edit.text()
             self.save_labels_json()
             self.export_tables()
-            self.set_status(f"已保存：{path.name}")
+            self.set_status(f"已保存 {path.name} · 最终夹角 {final_angle_text(result)}°")
             self.canvas.update()
-            self._refresh_side()
+            self._refresh_all()
             return True
         except Exception as exc:
-            QMessageBox.critical(self, "计算/保存失败", str(exc))
-            self.set_status(f"失败：{exc}")
+            QMessageBox.warning(self, "还不能保存", str(exc))
+            self.set_status(f"保存失败：{exc}")
             return False
 
     def save_and_next(self):
-        if self.save_current():
-            if self.index >= len(self.images) - 1:
-                self.set_status("已保存最后一张，全部完成")
-                QMessageBox.information(self, "完成", "已经保存最后一张。所有图片处理完成。")
-                return
-            self.next_image()
+        if not self.save_current():
+            return
+        if self.index >= len(self.images) - 1:
+            self.set_status(f"全部完成 · {self.done_count()}/{len(self.images)}")
+            QMessageBox.information(self, "完成",
+                                    f"已保存最后一张。\n共完成 {self.done_count()}/{len(self.images)} 张。")
+            return
+        self.next_image()
 
     def export_tables(self):
         if self.output_dir is None:
             return
-        rows = []
         headers = ["IOL轴角度", "A-B角度", "最终夹角", "备注"]
+        rows = []
         for image in self.images:
             label = self.labels.get(self.image_key(image), default_label())
             full = row_for_image(image, label, label.get("result"))
@@ -1043,7 +1110,6 @@ class MainWindow(QMainWindow):
                 "备注": full.get("note", ""),
             })
         csv_path = self.output_dir / "iol_tilt_results.csv"
-        xlsx_path = self.output_dir / "iol_tilt_results.xlsx"
         import csv as _csv
         tmp_csv = csv_path.with_name(f".{csv_path.stem}.tmp{csv_path.suffix}")
         with tmp_csv.open("w", newline="", encoding="utf-8-sig") as f:
@@ -1051,22 +1117,23 @@ class MainWindow(QMainWindow):
             writer.writeheader()
             writer.writerows(rows)
         tmp_csv.replace(csv_path)
-        write_xlsx(xlsx_path, headers, rows)
+        write_xlsx(self.output_dir / "iol_tilt_results.xlsx", headers, rows)
 
     def open_output_folder(self):
         if self.output_dir is None:
-            QMessageBox.information(self, "还没有结果文件夹", "先打开图片文件夹/图片；保存后会生成 IOL_Tilt_Output。")
+            QMessageBox.information(self, "还没有结果文件夹",
+                                    "先打开图片；保存后会生成 IOL_Tilt_Output 文件夹。")
             return
         self.output_dir.mkdir(exist_ok=True)
         open_path(self.output_dir)
 
     def open_excel(self):
         if self.output_dir is None:
-            QMessageBox.information(self, "还没有 Excel", "先打开图片并点“保存当前”或“保存并下一张”。")
+            QMessageBox.information(self, "还没有 Excel", "先打开图片并保存一次。")
             return
         xlsx_path = self.output_dir / "iol_tilt_results.xlsx"
         if not xlsx_path.exists():
-            QMessageBox.information(self, "还没有 Excel", "先点“保存当前”或“保存并下一张”，软件才会生成 Excel。")
+            QMessageBox.information(self, "还没有 Excel", "先点“保存”，软件才会生成 Excel。")
             return
         open_path(xlsx_path)
 
@@ -1078,29 +1145,62 @@ class MainWindow(QMainWindow):
             return
         open_path(out_dir)
         self.set_status(f"已生成校准测试图：{out_dir}")
-        QMessageBox.information(self, "已生成",
-                                f"校准测试图已放到：\n{out_dir}\n\n先完成前/后表面生成自动轴；第 5 步可用紫色校验轴对照，结果应接近 00_标准答案.csv。")
 
-    # ---------- refresh ----------
+    def show_help(self):
+        QMessageBox.information(self, "快捷键与用法", HELP_TEXT)
+
+    def show_about(self):
+        QMessageBox.about(self, f"关于 {APP_NAME}",
+                          f"<b>{APP_NAME}</b> {APP_VERSION}<br><br>"
+                          "人工晶体（IOL）相对 A-B 参考线的二维夹角标注工具。<br>"
+                          "测量口径：最终夹角 = IOL 轴角度 − A-B 角度（取锐角）。<br><br>"
+                          "<span style='color:#888'>结果为二维夹角，不是三维临床 IOL tilt。</span>")
+
+    # ---------------- 拖放 ----------------
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        paths = [Path(u.toLocalFile()) for u in e.mimeData().urls() if u.isLocalFile()]
+        if not paths:
+            return
+        if len(paths) == 1 and paths[0].is_dir():
+            folder = paths[0]
+            images = sorted(p for p in folder.iterdir() if p.suffix.lower() in SUPPORTED_EXTS)
+            self.start_session(images, folder)
+            return
+        images = sorted(p for p in paths if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS)
+        if images:
+            self.start_session(images, images[0].parent)
+        else:
+            self.set_status("拖进来的东西里没有可用图片")
+
+    # ---------------- 刷新 ----------------
     def _refresh_all(self):
         self._refresh_steps()
         self._refresh_side()
-        self._refresh_progress()
+        self._refresh_file_list_state()
+        self._refresh_header()
+        self._refresh_status_meta()
 
-    def _refresh_progress(self):
-        if self.images:
-            path = self.current_image_path()
-            self.set_status(f"{self.index + 1}/{len(self.images)} · {path.name if path else ''}")
+    def _refresh_header(self):
+        path = self.current_image_path()
+        if path is None:
+            self.file_label.setText("未打开图片")
+            self.index_label.setText("")
+        else:
+            self.file_label.setText(path.name)
+            self.index_label.setText(f"{self.index + 1}/{len(self.images)}")
+        has = bool(self.images)
+        for b in (self.btn_save, self.btn_save_next, self.btn_undo):
+            b.setEnabled(has)
+        self.btn_prev.setEnabled(has and self.index > 0)
+        self.btn_next.setEnabled(has and self.index < len(self.images) - 1)
 
     def _refresh_steps(self):
         label = self.current_label()
-        counts = {
-            "guide": len(label.get("guide", [])),
-            "pupil": len(label.get("pupil_plane", [])),
-            "anterior": len(label.get("anterior", [])),
-            "posterior": len(label.get("posterior", [])),
-            "manual_axis": len(label.get("manual_iol_axis", [])),
-        }
+        counts = {m: len(label.get(key_of(m), [])) for m in MODES}
         ready = {
             "guide": counts["guide"] > 0,
             "pupil": counts["pupil"] == 2,
@@ -1108,234 +1208,205 @@ class MainWindow(QMainWindow):
             "posterior": counts["posterior"] >= 3,
             "manual_axis": counts["manual_axis"] == 2,
         }
-        count_text = {
-            "guide": f"{counts['guide']} 点",
+        text = {
+            "guide": f"{counts['guide']}",
             "pupil": f"{counts['pupil']}/2",
-            "anterior": f"{counts['anterior']} 点",
-            "posterior": f"{counts['posterior']} 点",
+            "anterior": f"{counts['anterior']}",
+            "posterior": f"{counts['posterior']}",
             "manual_axis": f"{counts['manual_axis']}/2",
         }
         for mode, row in self.step_rows.items():
-            is_active = (mode == self.mode)
-            is_ready = ready[mode]
-            if is_active:
-                hint = "当前步骤 · 点击影像取点"
-            elif is_ready:
-                hint = "已就绪"
-            elif mode == "guide":
-                hint = "可选 · 多点参考"
-            else:
-                hint = MODE_META[mode][2]
-            row.set_state(is_active, is_ready, count_text[mode], hint)
+            row.set_state(mode == self.mode, ready[mode], text[mode])
 
-    def _refresh_side(self):
+    def _refresh_side(self, light: bool = False):
         label = self.current_label()
-        # points text
-        lines = []
-        for key, title in [("guide", "C-D"), ("pupil_plane", "A-B"),
-                           ("anterior", "前表面"), ("posterior", "后表面"),
-                           ("manual_iol_axis", "校验轴")]:
-            pts = as_points(label.get(key, []))
-            if not pts:
-                continue
-            lines.append(f"{title} 坐标：")
-            for i, p in enumerate(pts, 1):
-                lines.append(f"  {i}. {fmt_point(p)}")
-        self.points_box.setPlainText("\n".join(lines) if lines else "还没有取点")
-
-        result = label.get("result")
-        if not result:
-            try:
-                result = compute_result(label)
-                preview = True
-            except Exception:
-                result = None
-                preview = False
-        else:
-            preview = False
+        saved = label.get("result")
+        result = saved or self._preview_result(label)
 
         if result:
-            val = final_angle_text(result) or "N/A"
-            suffix = "" if str(val).endswith("°") else "°"
-            self.result_value.setText(f"{val}{suffix}")
-            note = result.get("fit_quality_note", "")
-            prefix = "预览未保存。" if preview else "已保存。"
-            self.result_caption.setText(f"{prefix}{note}")
-            self.chip_dir.setText(f"方向 {fmt_number(result.get('difference'))}°")
-            self.chip_quality.setText(f"质量 {str(result.get('fit_quality','--')).upper()}")
-            self.chip_axis.setText("参考轴" if result.get("axis_source") == "manual_reference" else "自动轴")
-            self._set_detail(result)
+            self.result_value.setText(f"{final_angle_text(result) or 'N/A'}°")
+            quality = result.get("fit_quality", "")
+            tone = {"good": "ok", "fair": "warn", "poor": "danger"}.get(quality, "")
+            axis = "参考轴（无自动轴）" if result.get("axis_source") == "manual_reference" else "自动轴"
+            note = {"good": "拟合良好", "fair": "拟合一般，建议复核点位",
+                    "poor": "拟合偏差大，建议重标", "manual": "仅参考轴"}.get(quality, "")
+            state = "已保存" if saved else "未保存"
+            self.result_caption.setText(f"{axis} · {note} · {state}")
+            self.result_caption.setProperty("tone", tone)
+            self.result_caption.style().unpolish(self.result_caption)
+            self.result_caption.style().polish(self.result_caption)
+            rms = [v for v in (result.get("front_fit_rms_px"), result.get("back_fit_rms_px"))
+                   if v not in (None, "")]
+            self._set_detail({
+                "iol_angle": fmt_number(result.get("iol_angle")) + "°",
+                "pupil_angle": fmt_number(result.get("pupil_angle")) + "°",
+                "difference": (f"{float(result['difference']):+.3f}°"
+                               if result.get("difference") not in (None, "") else "—"),
+                "manual_delta": (fmt_number(result.get("manual_vs_auto_delta")) + "°"
+                                 if result.get("manual_vs_auto_delta") not in (None, "") else "—"),
+                "rms": (f"{max(float(v) for v in rms):.2f} px" if rms else "—"),
+                "counts": f"{result.get('anterior_n', 0)} / {result.get('posterior_n', 0)}",
+            })
         else:
-            self.result_value.setText("待测")
-            self.result_caption.setText("按步骤取点后自动预览，保存后写入结果")
-            self.chip_dir.setText("方向 待定")
-            self.chip_quality.setText("质量 待定")
-            self.chip_axis.setText("轴 待定")
-            for v in self.detail_labels.values():
-                v.setText("—")
-                v.setProperty("tone", "")
-                v.style().unpolish(v); v.style().polish(v)
+            self.result_value.setText("—")
+            self.result_caption.setText(self._next_hint(label))
+            self.result_caption.setProperty("tone", "")
+            self.result_caption.style().unpolish(self.result_caption)
+            self.result_caption.style().polish(self.result_caption)
+            self._set_detail({k: "—" for k in self.detail_labels})
 
-    def _set_detail(self, r: dict):
-        def q(v): return fmt_number(v)
-        mapping = {
-            "iol_angle": q(r.get("iol_angle")) + "°",
-            "auto_iol_angle": (q(r.get("auto_iol_angle")) + "°") if r.get("auto_iol_angle") not in (None, "") else "—",
-            "pupil_angle": q(r.get("pupil_angle")) + "°",
-            "difference": q(r.get("difference")) + "°",
-            "final_angle": (final_angle_text(r) or "N/A") + "°",
-            "front_rms": (q(r.get("front_fit_rms_px")) + " px") if r.get("front_fit_rms_px") not in (None, "") else "—",
-            "back_rms": (q(r.get("back_fit_rms_px")) + " px") if r.get("back_fit_rms_px") not in (None, "") else "—",
-            "manual_delta": (q(r.get("manual_vs_auto_delta")) + "°") if r.get("manual_vs_auto_delta") not in (None, "") else "—",
-            "axis": "参考轴" if r.get("axis_source") == "manual_reference" else "自动轴",
-            "counts": f"{r.get('anterior_n', 0)} / {r.get('posterior_n', 0)}",
-        }
-        tone = {"good": "good", "fair": "warn", "poor": "warn", "manual": ""}.get(r.get("fit_quality"), "")
-        for key, text in mapping.items():
-            lbl = self.detail_labels[key]
-            lbl.setText(text)
-            if key in ("front_rms", "back_rms"):
-                lbl.setProperty("tone", tone)
-            else:
-                lbl.setProperty("tone", "")
-            lbl.style().unpolish(lbl); lbl.style().polish(lbl)
+        if not light:
+            self._refresh_steps()
+            self._refresh_file_list_state()
 
-    # ---------- keyboard ----------
-    def keyPressEvent(self, e):
-        if e.matches(QKeySequence.Undo):
-            self.undo_shortcut()
-            return
-        if isinstance(self.focusWidget(), (QLineEdit, QPlainTextEdit)):
-            return super().keyPressEvent(e)
-        k = e.text().lower()
-        mapping = {"1": "guide", "2": "pupil", "3": "anterior", "4": "posterior", "5": "manual_axis"}
-        if k in mapping:
-            self.set_mode(mapping[k])
-        elif k == "u":
-            self.undo()
-        elif k == "s":
+    def _next_hint(self, label) -> str:
+        if not self.images:
+            return "打开图片后开始标注"
+        if len(label.get("pupil_plane", [])) != 2:
+            return "下一步：在第 2 步点 A、B 两点"
+        if len(label.get("anterior", [])) < 3:
+            return "下一步：第 3 步前表面至少 3 点"
+        if len(label.get("posterior", [])) < 3:
+            return "下一步：第 4 步后表面至少 3 点"
+        return "点位不足或拟合失败，检查前/后表面取点"
+
+    def _set_detail(self, mapping: dict[str, str]):
+        for key, lab in self.detail_labels.items():
+            lab.setText(mapping.get(key, "—"))
+
+    # ---------------- 键盘 ----------------
+    def eventFilter(self, obj, event):
+        if event.type() != QEvent.KeyPress:
+            return super().eventFilter(obj, event)
+        if not self.isActiveWindow():
+            return super().eventFilter(obj, event)
+        focus = QApplication.focusWidget()
+        if isinstance(focus, QLineEdit):
+            return super().eventFilter(obj, event)
+        if event.modifiers() & (Qt.ControlModifier | Qt.MetaModifier | Qt.AltModifier):
+            return super().eventFilter(obj, event)
+
+        key = event.key()
+        step = 5.0 if event.modifiers() & Qt.ShiftModifier else 1.0
+        arrows = {Qt.Key_Left: (-step, 0), Qt.Key_Right: (step, 0),
+                  Qt.Key_Up: (0, -step), Qt.Key_Down: (0, step)}
+        if key in arrows and self.canvas.selected:
+            if self.nudge_selected(*arrows[key]):
+                return True
+        text = event.text().lower()
+        digits = {m[0]: k for k, m in MODE_META.items()}
+        if text in digits:
+            self.set_mode(digits[text])
+            return True
+        if text == "s":
             self.save_current()
-        elif k == "n":
+            return True
+        if text == "n":
             self.next_image()
-        elif k == "p":
+            return True
+        if text == "p":
             self.prev_image()
-        elif k in ("+", "="):
-            self.zoom_step(1.2)
-        elif k == "-":
-            self.zoom_step(1 / 1.2)
-        else:
-            super().keyPressEvent(e)
+            return True
+        if text == "f":
+            self.canvas.fit()
+            return True
+        if text == "l":
+            self.btn_loupe.setChecked(not self.btn_loupe.isChecked())
+            self.toggle_loupe()
+            return True
+        if text in ("+", "="):
+            self.canvas.zoom_by(1.2)
+            return True
+        if text == "-":
+            self.canvas.zoom_by(1 / 1.2)
+            return True
+        return super().eventFilter(obj, event)
 
-    # ---------- style ----------
-    def _apply_style(self):
-        self.setStyleSheet(QSS)
+    def closeEvent(self, e):
+        try:
+            self.save_note()
+        except Exception:
+            pass
+        super().closeEvent(e)
 
 
-QSS = f"""
-QMainWindow, QWidget {{ background: {C['bg']}; color: {C['text']}; font-family: "{FONT_FAMILY}"; }}
-#TopBar {{ background: {C['topbar']}; border-bottom: 1px solid {C['topbar_line']}; }}
-#BrandMark {{ background: transparent; }}
-#BrandTitle {{ font-size: 17px; font-weight: 700; color: {C['text']}; background: transparent; }}
-#BrandSub {{ font-size: 12px; color: {C['text3']}; background: transparent; }}
-#StatusText {{ color: {C['primary']}; font-weight: 600; font-size: 13px; background: transparent; }}
+HELP_TEXT = f"""标注流程
+1. 打开文件夹，或把图片/文件夹直接拖进窗口
+2. 第 2 步点 A、B 两点（瞳孔平面），点满自动进入第 3 步
+3. 第 3/4 步在晶体前、后表面各点 3 个以上，自动拟合出 IOL 轴
+4. 第 5 步可选：点 2 个参考点，只用来校验自动轴
+5. 保存并下一张，结果自动写入 Excel
 
-QPushButton#Primary {{
-  background: {C['primary']}; color: white; border: none; border-radius: 11px;
-  padding: 9px 16px; font-size: 13px; font-weight: 600;
-}}
-QPushButton#Primary:hover {{ background: {C['primary_hover']}; }}
-QPushButton#Secondary {{
-  background: {C['surface']}; color: {C['text']}; border: 1px solid {C['line']};
-  border-radius: 11px; padding: 9px 16px; font-size: 13px; font-weight: 600;
-}}
-QPushButton#Secondary:hover {{ background: {C['surface3']}; border-color: #d4dbe6; }}
-QPushButton#Danger {{
-  background: {C['danger_soft']}; color: {C['danger']}; border: 1px solid #ffd9df;
-  border-radius: 11px; padding: 9px 16px; font-size: 13px; font-weight: 600;
-}}
-QPushButton#Danger:hover {{ background: #ffe4e9; }}
+鼠标
+左键：取点 · 拖动已有点：微调 · {OPT}点击：删除该点
+右键 / 中键拖动：平移 · 滚轮：缩放 · 双击空白：适配窗口
 
-#LeftScroll {{ border: none; background: {C['bg']}; }}
-#LeftScroll > QWidget > QWidget {{ background: {C['bg']}; }}
+键盘
+1–5 切换步骤 · S 保存 · P / N 上下一张 · F 适配 · L 放大镜
+方向键微调选中点（{SHIFT}加速）· Delete 删除选中点
+{CMD}Z 撤销 · {SHIFT}{CMD}Z 重做 · {CMD}S 保存 · {CMD}{ENTER} 保存并下一张
+{CMD}0 适配 · {CMD}1 实际像素 · {CMD}L 放大镜 · {CMD}K 准星 · {CMD}E 打开 Excel
 
-#Card {{ background: {C['surface']}; border: 1px solid {C['line']}; border-radius: 16px; }}
-#CardTitle {{ font-size: 12px; font-weight: 700; color: {C['text3']}; }}
-#Muted {{ font-size: 12px; color: {C['text3']}; }}
-#CollapseSection {{ background: transparent; border: none; }}
-#CollapseHeader {{
-  background: {C['surface']}; color: {C['text2']}; border: 1px solid {C['line']}; border-radius: 14px;
-  padding: 10px 14px; text-align: left; font-size: 13px; font-weight: 700;
-}}
-#CollapseHeader:hover {{ background: {C['surface2']}; color: {C['text']}; }}
-#CollapseHeader[expanded="true"] {{ background: {C['surface2']}; color: {C['text']}; border-color: #d8e0eb; }}
-#CollapseBody {{ background: transparent; }}
-#Divider {{ color: {C['line2']}; background: {C['line2']}; border: none; }}
-#DividerLabel {{ font-size: 11px; font-weight: 700; color: {C['text3']}; }}
-#Footnote {{ font-size: 12px; color: {C['text3']}; padding: 4px; }}
+结果
+最终夹角 = IOL 轴角度 − A-B 角度（取锐角），自动轴优先。
+Excel 只导四列：IOL轴角度 / A-B角度 / 最终夹角 / 备注。"""
 
-#Step {{ background: {C['surface2']}; border: 1px solid {C['line2']}; border-radius: 12px; }}
-#Step[state="active"] {{ background: {C['primary_soft']}; border: 1px solid {C['primary']}; }}
-#Step[state="ready"] {{ background: {C['success_soft']}; border: 1px solid {C['success_line']}; }}
-#StepBadge {{ background: {C['surface3']}; color: {C['text2']}; border: 1px solid {C['line']};
-  border-radius: 7px; font-size: 12px; font-weight: 700; }}
-#StepBadge[state="active"] {{ background: {C['primary']}; color: white; border: 1px solid {C['primary']}; }}
-#StepBadge[state="ready"] {{ background: {C['success']}; color: white; border: 1px solid {C['success']}; }}
-#StepName {{ font-size: 13px; font-weight: 600; color: {C['text']}; }}
-#StepCount {{ font-size: 12px; font-weight: 700; color: {C['text3']}; }}
-#StepCount[state="active"] {{ color: {C['primary']}; }}
-#StepHint {{ font-size: 11px; color: {C['text3']}; padding-left: 31px; }}
-#StepHint[state="active"] {{ color: {C['primary']}; }}
 
-#ResultCard {{ background: {C['surface']}; border: 1px solid {C['line']}; border-radius: 16px; }}
-#ResultLabel {{ color: {C['text3']}; font-size: 11px; font-weight: 700; letter-spacing: 2px; background: transparent; }}
-#ResultValue {{ color: {C['text']}; font-size: 48px; font-weight: 700; background: transparent; }}
-#ResultCaption {{ color: {C['text2']}; font-size: 12px; background: transparent; }}
-#ChipBlue {{ background: {C['primary_soft']}; color: {C['primary']}; border-radius: 9px; padding: 6px 10px; font-size: 11px; font-weight: 600; }}
-#ChipGreen {{ background: {C['success_soft']}; color: {C['success']}; border-radius: 9px; padding: 6px 10px; font-size: 11px; font-weight: 600; }}
-#ChipPurple {{ background: #f4f0ff; color: {C['accent1']}; border-radius: 9px; padding: 6px 10px; font-size: 11px; font-weight: 600; }}
+def _demo_points(win: MainWindow) -> None:
+    """调试用：给当前图注入一组示例点位，方便离线看界面效果。"""
+    if not win.images:
+        return
+    w, h = win.original_image.size
+    label = win.current_label()
 
-#DetailKey {{ font-size: 10px; color: {C['text3']}; }}
-#DetailVal {{ font-size: 12px; font-weight: 600; color: {C['text']}; font-family: "{MONO_FAMILY}"; }}
-#DetailVal[tone="good"] {{ color: {C['success']}; }}
-#DetailVal[tone="warn"] {{ color: #b26a00; }}
-#PointsBox {{ background: {C['surface2']}; border: 1px solid {C['line']}; border-radius: 10px;
-  color: {C['text2']}; font-family: "{MONO_FAMILY}"; font-size: 11px; padding: 6px; }}
-#Note {{ background: {C['surface2']}; border: 1px solid {C['line']}; border-radius: 11px;
-  padding: 9px 12px; font-size: 13px; color: {C['text']}; }}
-#Note:focus {{ border: 1px solid {C['primary']}; background: white; }}
+    def curve(x, base):
+        return base + 0.00055 * (x - w / 2) ** 2
 
-#Segmented {{ background: {C['surface3']}; border: 1px solid {C['line']}; border-radius: 12px; }}
-#SegBtn {{ background: transparent; color: {C['text2']}; border: none; border-radius: 9px;
-  padding: 8px 6px; font-size: 13px; font-weight: 600; }}
-#SegBtn:hover {{ background: white; color: {C['text']}; }}
-#LegendText {{ font-size: 12px; color: {C['text2']}; }}
-
-#CanvasCard {{ background: {C['surface']}; border: 1px solid {C['line']}; border-radius: 16px; }}
-#CanvasHead {{ background: {C['surface']}; border-bottom: 1px solid {C['line2']};
-  border-top-left-radius: 16px; border-top-right-radius: 16px; }}
-#CanvasTitle {{ font-size: 14px; font-weight: 700; color: {C['text']}; }}
-#CanvasInfo {{ font-size: 12px; color: {C['text3']}; }}
-#CursorLabel {{ font-size: 12px; color: {C['text3']}; font-family: "{MONO_FAMILY}"; }}
-
-QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
-QScrollBar::handle:vertical {{ background: #d4dbe6; border-radius: 5px; min-height: 30px; }}
-QScrollBar::handle:vertical:hover {{ background: #b9c4d4; }}
-QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
-"""
+    xs = [w * 0.36, w * 0.44, w * 0.56, w * 0.64]
+    label["pupil_plane"] = [[round(w * 0.16, 3), round(h * 0.512, 3)],
+                            [round(w * 0.84, 3), round(h * 0.500, 3)]]
+    label["anterior"] = [[round(x, 3), round(curve(x, h * 0.434), 3)] for x in xs]
+    label["posterior"] = [[round(x, 3), round(curve(x, h * 0.513), 3)] for x in xs]
+    label["note"] = "示例数据"
+    win.set_mode("posterior")
+    win.canvas.update()
+    win._refresh_all()
 
 
 def main():
+    QApplication.setApplicationName(APP_NAME)
+    QApplication.setApplicationDisplayName("")
+    QApplication.setOrganizationName("xiao")
     app = QApplication(sys.argv)
     icon_path = resource_path("windows", "IOLTiltLabeler.ico")
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
+
+    argv = [a for a in sys.argv[1:]]
+    shot_path = None
+    if "--shot" in argv:
+        i = argv.index("--shot")
+        shot_path = argv[i + 1] if i + 1 < len(argv) else None
+        del argv[i:i + 2]
+    demo = "--demo" in argv
+    argv = [a for a in argv if not a.startswith("--")]
+
     win = MainWindow()
     win.show()
-    if len(sys.argv) > 1:
-        folder = Path(sys.argv[1]).expanduser()
-        if folder.exists() and folder.is_dir():
-            images = sorted(p for p in folder.iterdir() if p.suffix.lower() in SUPPORTED_EXTS)
-            win.start_session(images, folder)
+    if argv:
+        target = Path(argv[0]).expanduser()
+        if target.is_dir():
+            images = sorted(p for p in target.iterdir() if p.suffix.lower() in SUPPORTED_EXTS)
+            win.start_session(images, target)
+        elif target.is_file() and target.suffix.lower() in SUPPORTED_EXTS:
+            win.start_session([target], target.parent)
+    if demo:
+        _demo_points(win)
+    if shot_path:
+        def grab_and_quit():
+            win.grab().save(shot_path)
+            app.quit()
+        QTimer.singleShot(900, grab_and_quit)
     sys.exit(app.exec())
 
 

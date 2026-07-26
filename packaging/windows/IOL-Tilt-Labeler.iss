@@ -1,5 +1,5 @@
 #define MyAppName "IOL Tilt Labeler"
-#define MyAppVersion "1.1.0"
+#define MyAppVersion "1.2.0"
 #define MyAppPublisher "xiao"
 #define MyAppExeName "IOL Tilt Labeler.exe"
 #define MyAppId "{{5B6DC633-88B8-4E9D-9DDE-8F656824B7A4}"
@@ -28,7 +28,7 @@ OutputManifestFile=setup-manifest.txt
 Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 
 [Tasks]
-Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加快捷方式："; Flags: unchecked
+Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加快捷方式："
 
 [Files]
 Source: "..\..\dist\IOL Tilt Labeler\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs

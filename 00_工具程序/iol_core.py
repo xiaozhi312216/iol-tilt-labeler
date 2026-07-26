@@ -369,10 +369,17 @@ def save_annotated_image(output_dir: Path, output_stem: str, image_path: Path, l
         if text:
             draw.text((x + 8, y - 18), text, fill=color, font=small_font)
 
+    # 第 5 步的自动轴校验点（紫色），只作对照，不参与计算
+    manual_axis = as_points(label.get("manual_iol_axis", []))
+    if len(manual_axis) == 2 and result.get("axis_source") != "manual_reference":
+        draw.line(manual_axis, fill=(191, 90, 242), width=2)
+
     for i, p in enumerate(anterior):
         marker(p, (245, 220, 0), 4, f"F{i+1}")
     for i, p in enumerate(posterior):
         marker(p, (255, 149, 0), 4, f"B{i+1}")
+    for i, p in enumerate(manual_axis):
+        marker(p, (191, 90, 242), 5, f"M{i+1}")
     marker(pupil[0], (0, 220, 255), 6, "A")
     marker(pupil[1], (0, 220, 255), 6, "B")
     marker(iol_axis[0], (255, 40, 40), 6)
@@ -392,9 +399,11 @@ def save_annotated_image(output_dir: Path, output_stem: str, image_path: Path, l
         draw.text((x, y), text, fill=(255, 255, 255), font=main_font)
 
     out = output_dir / "annotated" / f"{output_stem}_annotated.png"
+    out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_name(f".{out.name}.tmp")
     image.save(tmp, format="PNG")
     tmp.replace(out)
+    return out
 
 
 def row_for_image(image: Path, label: dict[str, Any], result: dict[str, Any] | None) -> dict[str, Any]:

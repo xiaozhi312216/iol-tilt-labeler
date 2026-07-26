@@ -13,6 +13,7 @@ Thumbs.db
 
 # Local apps and launchers
 LOL.app/
+*.app/
 *.command
 
 # Patient images, historical case material, and local processing output
@@ -33,6 +34,5 @@ LOL.app/
 00_工具程序/iol_tilt_labeler.tkinter.bak
 00_工具程序/measure_iol_tilt.py
 00_工具程序/prepare_iol_case.py
-00_工具程序/IOL_Tilt_Labeler_使用说明.md
 README_先看我.md
 验证软件.rtf

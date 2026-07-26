@@ -1,16 +1,23 @@
 # -*- mode: python ; coding: utf-8 -*-
+"""macOS 打包配置：生成独立 .app，不依赖系统 Python。
+
+构建：.venv/bin/python -m PyInstaller --noconfirm --clean \
+        --distpath dist --workpath build packaging/macos/IOL-Tilt-Labeler.spec
+"""
 
 from pathlib import Path
 
 PROJECT_ROOT = Path(SPECPATH).resolve().parents[1]
 TOOLS_DIR = PROJECT_ROOT / "00_工具程序"
-ICON_PATH = PROJECT_ROOT / "resources" / "windows" / "IOLTiltLabeler.ico"
+ICNS = PROJECT_ROOT / "resources" / "macos" / "IOLTiltLabeler.icns"
+ICO = PROJECT_ROOT / "resources" / "windows" / "IOLTiltLabeler.ico"
+VERSION = "1.2.0"
 
 analysis = Analysis(
     [str(TOOLS_DIR / "iol_tilt_labeler_qt.py")],
     pathex=[str(TOOLS_DIR)],
     binaries=[],
-    datas=[(str(ICON_PATH), "resources/windows")],
+    datas=[(str(ICO), "resources/windows")],
     hiddenimports=[
         "PySide6.QtCore",
         "PySide6.QtGui",
@@ -45,7 +52,7 @@ exe = EXE(
     strip=False,
     upx=False,
     console=False,
-    icon=str(ICON_PATH),
+    icon=str(ICNS),
 )
 coll = COLLECT(
     exe,
@@ -55,4 +62,28 @@ coll = COLLECT(
     upx=False,
     upx_exclude=[],
     name="IOL Tilt Labeler",
+)
+app = BUNDLE(
+    coll,
+    name="IOL 倾斜标注.app",
+    icon=str(ICNS),
+    bundle_identifier="local.xiao.ioltiltlabeler",
+    version=VERSION,
+    info_plist={
+        "CFBundleName": "IOL 倾斜标注",
+        "CFBundleDisplayName": "IOL 倾斜标注",
+        "CFBundleShortVersionString": VERSION,
+        "CFBundleVersion": VERSION,
+        "NSHighResolutionCapable": True,
+        "LSMinimumSystemVersion": "11.0",
+        "NSHumanReadableCopyright": "© 2026 xiao",
+        "CFBundleDocumentTypes": [
+            {
+                "CFBundleTypeName": "OCT 图片",
+                "CFBundleTypeRole": "Editor",
+                "LSItemContentTypes": ["public.jpeg", "public.png", "public.tiff",
+                                       "com.microsoft.bmp"],
+            }
+        ],
+    },
 )

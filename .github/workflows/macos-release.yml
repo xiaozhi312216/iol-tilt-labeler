@@ -1,0 +1,88 @@
+name: Build macOS app
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-13          # Intel runner：产物在 Intel 与 Apple Silicon（Rosetta）上都能跑
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Read version
+        id: version
+        run: |
+          version=$(grep -m1 'APP_VERSION = ' "00_工具程序/iol_tilt_labeler_qt.py" | cut -d'"' -f2)
+          if [ -z "$version" ]; then echo "APP_VERSION not found"; exit 1; fi
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Validate release tag version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$tag" != "${{ steps.version.outputs.value }}" ]; then
+            echo "Tag v$tag does not match app version ${{ steps.version.outputs.value }}"
+            exit 1
+          fi
+
+      - name: Build app bundle
+        run: |
+          python -m PyInstaller --noconfirm --clean \
+            --distpath dist --workpath build packaging/macos/IOL-Tilt-Labeler.spec
+          test -d "dist/IOL 倾斜标注.app" || { echo "app bundle missing"; exit 1; }
+
+      - name: Create DMG
+        id: dmg
+        run: |
+          version="${{ steps.version.outputs.value }}"
+          mkdir -p release/macos stage
+          cp -R "dist/IOL 倾斜标注.app" stage/
+          ln -s /Applications stage/Applications
+          dmg="release/macos/IOL倾斜标注-${version}.dmg"
+          hdiutil create -volname "IOL 倾斜标注 ${version}" -srcfolder stage -ov -format UDZO "$dmg"
+          hash=$(shasum -a 256 "$dmg" | cut -d' ' -f1)
+          printf 'Installer: %s\nVersion: %s\nSHA256: %s\n' "$(basename "$dmg")" "$version" "$hash" \
+            > release/macos/dmg-manifest.txt
+          echo "path=$dmg" >> "$GITHUB_OUTPUT"
+          echo "sha=$hash" >> "$GITHUB_OUTPUT"
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: IOL-Tilt-Labeler-macos-x64-${{ steps.version.outputs.value }}-${{ github.sha }}
+          path: |
+            ${{ steps.dmg.outputs.path }}
+            release/macos/dmg-manifest.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach DMG to release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 || \
+            gh release create "${GITHUB_REF_NAME}" --title "IOL Tilt Labeler ${GITHUB_REF_NAME}" \
+              --notes "macOS 与 Windows 安装包见下方附件。"
+          gh release upload "${GITHUB_REF_NAME}" \
+            "${{ steps.dmg.outputs.path }}" release/macos/dmg-manifest.txt --clobber
