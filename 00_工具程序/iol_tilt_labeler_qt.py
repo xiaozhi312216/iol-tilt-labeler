@@ -1024,7 +1024,9 @@ class MainWindow(QMainWindow):
         self.canvas.set_image(self.original_image)
         self.note_edit.setText(str(self.current_label().get("note", "")))
         if fit:
+            # 延到布局稳定后再适配，否则启动时带参数打开会按初始尺寸算缩放
             self.canvas.fit()
+            QTimer.singleShot(0, self.canvas.fit)
         self._loading = True
         self.file_list.setCurrentRow(self.index)
         self._loading = False
