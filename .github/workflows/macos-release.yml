@@ -58,7 +58,7 @@ jobs:
           mkdir -p release/macos stage
           cp -R "dist/IOL 倾斜标注.app" stage/
           ln -s /Applications stage/Applications
-          dmg="release/macos/IOL倾斜标注-${version}.dmg"
+          dmg="release/macos/IOL-Tilt-Labeler-${version}-macOS-x64.dmg"   # 用 ASCII 名，GitHub Release 会吃掉中文文件名
           hdiutil create -volname "IOL 倾斜标注 ${version}" -srcfolder stage -ov -format UDZO "$dmg"
           hash=$(shasum -a 256 "$dmg" | cut -d' ' -f1)
           printf 'Installer: %s\nVersion: %s\nSHA256: %s\n' "$(basename "$dmg")" "$version" "$hash" \
